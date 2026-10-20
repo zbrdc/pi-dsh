@@ -10,13 +10,14 @@ import { Type } from "typebox";
 import {
   RepeatTracker, spillText, pruneText, validateTodos, generateSdk,
   newGoal, applyBlocker, renderGoalRound, renderTaskControlSection, Semaphore, completedTurnCut,
-  resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog,
+  resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, parseOutputSchema,
   SANDBOX_ORDER, type TodoItem, type Goal, type SandboxMode,
 } from "./core.ts";
 import { JobRegistry } from "./jobs.ts";
 import { TerminalRegistry, PersistentBash, runShellJob } from "./terminal.ts";
 import { NodePtcProvider, MossbedProvider, PythonPtcProvider, type PtcBindings } from "./ptc.ts";
-import { SubagentManager, type CatalogEntry } from "./subagent.ts";
+import { SubagentManager, renderAgentLine, type CatalogEntry } from "./subagent.ts";
+import { TeamBoard, renderTeamTask, type TeamTaskAction } from "./team.ts";
 import { renderAgentsWidget, renderDashboard, renderGoalWidget, renderJobsWidget, renderStatusLine, renderTodoWidget, type UiState } from "./ui.ts";
 
 const ENTRY = { todo: "pi-dsh/todo", plan: "pi-dsh/plan", goal: "pi-dsh/goal", catalog: "pi-dsh/catalog", team: "pi-dsh/team-tasks" };
@@ -33,6 +34,10 @@ interface Config {
   toolTimeoutAction: "abort" | "notify";
   durableTerminals: boolean;
   sandboxRunnerCommand?: string[];
+  maxSubagentDepth: number; subagentTimeoutMs?: number;
+  subagentModels?: string[];
+  subagentPresets?: Record<string, { description?: string; systemAppend?: string; tools?: string[]; model?: string; thinkingLevel?: string }>;
+  maxTeamMembers: number; maxTeamTasks: number;
 }
 function loadConfig(): Config {
   const defaults: Config = {
@@ -40,6 +45,7 @@ function loadConfig(): Config {
     ptcOnly: false, persistentPtc: false, maxActiveSubagents: 8, goalBlockedThreshold: 3,
     sandboxMode: "danger-full-access", maxParallelSubCalls: 10, completionDelivery: "wakeup",
     uiWidgets: true, toolTimeoutAction: "abort", durableTerminals: false,
+    maxSubagentDepth: 1, maxTeamMembers: 16, maxTeamTasks: 256,
   };
   try {
     const path = join(homedir(), ".pi", "agent", "pi-dsh.json");
@@ -57,7 +63,11 @@ export default function (pi: any) {
   const mossbed = new MossbedProvider();
   jobs.setPersistRoot(join(homedir(), ".pi", "agent", "pi-dsh", "jobs"));
   terminals.setPersistRoot(join(homedir(), ".pi", "agent", "pi-dsh", "terminals"));
-  const subagents = new SubagentManager({ maxActive: config.maxActiveSubagents });
+  const board = new TeamBoard(config.maxTeamTasks);
+  const subagents = new SubagentManager({
+    maxActive: config.maxActiveSubagents, maxDepth: config.maxSubagentDepth,
+    defaultTimeoutMs: config.subagentTimeoutMs, board,
+  });
   const watchdog = new ToolWatchdog();
 
   let lastCtx: any;
@@ -70,9 +80,7 @@ export default function (pi: any) {
   let pendingGoalRound: number | undefined;
   let pendingPlanPrompt: string | undefined;
   let lastControlSection = "";
-  interface TeamTask { id: string; subject: string; description: string; status: string; owner?: string }
-  let teamTasks: TeamTask[] = [];
-  let teamSeq = 0;
+  let teamEntries: unknown[] = [];
   let persistentBash: PersistentBash | undefined;
   let persistentPwsh: PersistentBash | undefined;
   const repeat = new RepeatTracker([3, 5, 8]);
@@ -91,7 +99,7 @@ export default function (pi: any) {
   };
   const uiState = (): UiState => ({
     goal, todos, planActive,
-    jobs: jobs.list(owner), agents: subagents.list(owner), terminals: terminals.list(owner), teamTasks,
+    jobs: jobs.list(owner), agents: subagents.list(owner), terminals: terminals.list(owner), teamTasks: board.snapshot(),
   });
   /** One refresh for every widget + status (DSH ui-goal/ui-jobs/ui-subagent, Pi-shaped). */
   const refreshUI = () => {
@@ -141,20 +149,21 @@ export default function (pi: any) {
 
   function restore(ctx: any) {
     remember(ctx);
-    todos = []; planActive = false; goal = undefined; teamTasks = []; pendingGoalRound = undefined; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
+    todos = []; planActive = false; goal = undefined; teamEntries = []; pendingGoalRound = undefined; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
     const catalog: CatalogEntry[] = [];
     for (const e of ctx.sessionManager.getBranch()) {
       if (e.type !== "custom") continue;
       if (e.customType === ENTRY.todo) todos = (e.data as TodoItem[]) ?? [];
       if (e.customType === ENTRY.plan) { planActive = Boolean((e.data as any)?.active); if (typeof (e.data as any)?.prompt === "string" && planActive) pendingPlanPrompt = (e.data as any).prompt; }
       if (e.customType === ENTRY.goal) goal = e.data as Goal;
-      if (e.customType === ENTRY.team) { teamTasks = (e.data as TeamTask[]) ?? []; teamSeq = teamTasks.length; }
+      if (e.customType === ENTRY.team) teamEntries = (e.data as unknown[]) ?? [];
       if (e.customType === ENTRY.catalog) {
         const entry = e.data as CatalogEntry;
         const i = catalog.findIndex((c) => c.childId === entry.childId);
         if (i >= 0) catalog[i] = entry; else catalog.push(entry);
       }
     }
+    board.restore(teamEntries);
     subagents.restore(catalog);
     jobs.restore(owner);
     terminals.restore(owner);
@@ -660,25 +669,83 @@ export default function (pi: any) {
   subagents.onSettle = (entry, result, delivery) => {
     refreshUI();
     if (entry.owner !== owner || delivery !== "parent") return;
-    notify(`subagent ${entry.childId} (${entry.provider}: ${entry.label}) finished [status: ${result.status}]. Final answer:\n${result.text.slice(0, 8000)}`, "pi-dsh/subagent-complete");
+    notify(`subagent ${entry.childId} (${entry.provider}: ${entry.label}, depth ${entry.depth}) finished [status: ${result.status}${result.stopReason && result.stopReason !== result.status ? `/${result.stopReason}` : ""}]. Final answer:\n${result.text.slice(0, 8000)}${result.data !== undefined ? `\nStructured result: ${JSON.stringify(result.data).slice(0, 4000)}` : ""}`, "pi-dsh/subagent-complete");
   };
+  subagents.onParentMessage = (from, message, messageId) => {
+    notify(`Agent ${from.name ?? from.label} (${from.childId}) sent a message (${messageId}):\n${message.slice(0, 8000)}`, "pi-dsh/agent-message");
+  };
+  /** Resolve an optional child model route ("provider/modelId" preferred,
+   * bare modelId when unique) against the live registry + allowlist. */
+  const resolveChildModel = (ctx: any, wanted?: string): { model: unknown; label?: string } | { error: string } => {
+    if (!wanted) return { model: ctx.model };
+    const available: any[] = ctx.modelRegistry?.getAvailable?.() ?? ctx.modelRegistry?.getAll?.() ?? [];
+    const labelOf = (m: any) => `${m.provider}/${m.id}`;
+    let found: any;
+    if (wanted.includes("/")) {
+      const slash = wanted.indexOf("/");
+      found = ctx.modelRegistry?.find?.(wanted.slice(0, slash), wanted.slice(slash + 1)) ?? available.find((m: any) => labelOf(m) === wanted);
+    } else {
+      const matches = available.filter((m: any) => m.id === wanted);
+      if (matches.length > 1) return { error: `model "${wanted}" is ambiguous (${matches.map(labelOf).join(", ")}); use provider/modelId` };
+      found = matches[0];
+    }
+    if (!found) return { error: `unknown subagent model route "${wanted}"; call list_subagent_models` };
+    const label = labelOf(found);
+    if (config.subagentModels && config.subagentModels.length > 0 && !config.subagentModels.includes(label)) {
+      return { error: `subagent model ${label} is not in the configured subagentModels allowlist` };
+    }
+    return { model: found, label };
+  };
+  subagents.opts.resolveModel = (label: string) => {
+    if (!lastCtx) return undefined;
+    const r = resolveChildModel(lastCtx, label);
+    return "model" in r ? r.model : undefined;
+  };
+  const resolvePreset = (name?: string): { preset?: NonNullable<Config["subagentPresets"]>[string] } | { error: string } => {
+    if (!name) return {};
+    const preset = config.subagentPresets?.[name];
+    if (!preset) return { error: `unknown subagent preset "${name}" (configured: ${Object.keys(config.subagentPresets ?? {}).join(", ") || "none"})` };
+    return { preset };
+  };
+  const forkSeed = (ctx: any): any[] => {
+    const msgs = ctx.sessionManager.getBranch()
+      .filter((e: any) => e.type === "message").map((e: any) => e.message);
+    return msgs.slice(0, completedTurnCut(msgs));
+  };
+  const THINKING = Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")]));
   const delegate = (provider: "spawn" | "fork", name: string, contextNote: string) => pi.registerTool({
     name, label: `Subagent (${provider})`, exposure: "model-only" as const,
-    description: `Delegate work to a fresh child agent and return its id immediately; the final answer arrives in a completion notice. ${contextNote} The child shares the workspace. Use for bounded, self-contained subtasks.`,
-    parameters: Type.Object({ task: Type.String(), label: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()) }),
+    description: `Delegate work to a fresh child agent and return its id immediately; the final answer arrives in a completion notice. ${contextNote} The child shares the workspace and runs at depth 1 of ${config.maxSubagentDepth}. Optional: model (provider/modelId, see list_subagent_models), thinking_level, preset (spawn only), timeout_ms, output_schema (requires structured_output). Use for bounded, self-contained subtasks; start independent delegations together. In single-shot print runs, collect results with wait_agent before finishing — background children are aborted when the process exits.`,
+    parameters: Type.Object({
+      task: Type.String(), label: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()), thinking_level: THINKING, preset: Type.Optional(Type.String()),
+      timeout_ms: Type.Optional(Type.Number()),
+      // Models often stringify the schema; accept both shapes and parse below.
+      output_schema: Type.Optional(Type.Union([Type.Object({}, { additionalProperties: true }), Type.String()])),
+      require_structured: Type.Optional(Type.Boolean()),
+    }),
+    prepareArguments: (args: any) => {
+      if (args && typeof args.output_schema === "string") {
+        try { return { ...args, output_schema: parseOutputSchema(args.output_schema) }; } catch { return args; }
+      }
+      return args;
+    },
     async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
       try {
-        let seedMessages: any[] | undefined;
-        if (provider === "fork") {
-          const msgs = ctx.sessionManager.getBranch()
-            .filter((e: any) => e.type === "message").map((e: any) => e.message);
-          seedMessages = msgs.slice(0, completedTurnCut(msgs));
-        }
+        const presetRes = resolvePreset(p.preset);
+        if ("error" in presetRes) return errText(`Error: ${presetRes.error}`);
+        const preset = presetRes.preset;
+        const modelRes = resolveChildModel(ctx, p.model ?? preset?.model);
+        if ("error" in modelRes) return errText(`Error: ${modelRes.error}`);
         const childId = await subagents.start({
           provider, label: p.label ?? "task", task: p.task, owner,
-          cwd: p.cwd ? resolvePath(ctx, p.cwd) : ctx.cwd, model: ctx.model,
-          seedMessages, delivery: "parent",
+          cwd: p.cwd ? resolvePath(ctx, p.cwd) : ctx.cwd, model: modelRes.model, modelLabel: modelRes.label,
+          thinkingLevel: p.thinking_level ?? preset?.thinkingLevel, preset: p.preset,
+          tools: preset?.tools, systemAppend: preset?.systemAppend,
+          timeoutMs: p.timeout_ms, outputSchema: parseOutputSchema(p.output_schema),
+          requireStructured: p.require_structured === true,
+          seedMessages: provider === "fork" ? forkSeed(ctx) : undefined, delivery: "parent",
         });
         return text(`started subagent ${childId}`);
       } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
@@ -687,105 +754,196 @@ export default function (pi: any) {
   delegate("spawn", "subagent", "It does NOT see this conversation; the task must stand alone.");
   delegate("fork", "subagent_fork", "It sees this conversation's completed turns, but NOT the current in-flight turn.");
   pi.registerTool({
-    name: "send_message", label: "Send message (subagent)", exposure: "model-only",
-    description: "Send a follow-up message to a continuable child subagent (steers if working, resumes if settled).",
-    parameters: Type.Object({ child_id: Type.String(), message: Type.String() }),
-    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
-      remember(ctx);
-      try { return text(await subagents.sendMessage(p.child_id, p.message)); }
-      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
-    },
-  });
-  pi.registerTool({
-    name: "interrupt_agent", label: "Interrupt agent", exposure: "model-only",
-    description: "Interrupt a running child subagent and wait for it to settle.",
-    parameters: Type.Object({ child_id: Type.String() }),
-    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
-      remember(ctx);
-      try { await subagents.interrupt(p.child_id); return text(`interrupted subagent ${p.child_id}`); }
-      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
-    },
-  });
-  pi.registerTool({
-    name: "list_agents", label: "List agents", exposure: "model-only",
-    description: "List child subagents of this session from the catalog (does not load transcripts).",
+    name: "list_subagent_models", label: "List subagent models", exposure: "model-only",
+    description: "List model routes available for subagent delegation (provider/modelId). Pass one as the model argument to subagent, subagent_fork, or spawn_teammate.",
     parameters: Type.Object({}),
     async execute(_i: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      const rows = subagents.list(owner).map((e) => `${e.childId} [${e.provider}] ${e.status} — ${e.label}`);
-      return text(rows.length ? rows.join("\n") : "No subagents.");
+      const available: any[] = ctx.modelRegistry?.getAvailable?.() ?? [];
+      const allow = config.subagentModels && config.subagentModels.length > 0 ? new Set(config.subagentModels) : undefined;
+      const rows = available.map((m: any) => `${m.provider}/${m.id}`).filter((r: string) => !allow || allow.has(r)).sort();
+      return text(rows.length ? rows.join("\n") : "No models available.");
     },
   });
-
-  // ---- Agent teams (experimental tool-agent-team shape) ----
-  const persistTeam = () => { refreshUI(); try { pi.appendEntry(ENTRY.team, teamTasks); } catch { /* gone */ } };
+  const resolveAgentRef = (p: any): string => String(p.agent_id ?? p.child_id ?? "");
   pi.registerTool({
-    name: "spawn_teammate", label: "Spawn teammate", exposure: "model-only",
-    description: "Spawn a continuable teammate subagent on this session's team. Returns its id; results arrive as completion notices, or via wait_agent.",
-    parameters: Type.Object({ name: Type.String(), task: Type.String() }),
+    name: "send_message", label: "Send message (subagent)", exposure: "model-only",
+    description: "Send a follow-up message to a continuable child subagent (steers if working, resumes if settled, cold-resumes from its saved session after a restart). Accepts a child id or teammate name. Returns delivery acceptance with a messageId, never a reply.",
+    parameters: Type.Object({ agent_id: Type.String(), message: Type.String(), deliver_as: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")])) }),
     async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
       try {
-        const childId = await subagents.start({
-          provider: "spawn", label: `team:${p.name}`, task: p.task, owner, cwd: ctx.cwd, model: ctx.model, delivery: "parent",
-          systemAppend: `You are teammate "${p.name}" on a shared team in this workspace. Coordinate through the shared files; finish by summarizing what you did and what remains.`,
-        });
-        return text(`spawned teammate ${p.name}: ${childId}`);
+        const target = subagents.resolve(owner, resolveAgentRef(p));
+        if (!target) return errText(`Error: message not delivered: unknown agent ${resolveAgentRef(p)}`);
+        return text(await subagents.sendMessageAs(owner, target.childId, String(p.message), p.deliver_as ?? "steer"));
       } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     },
   });
   pi.registerTool({
-    name: "wait_agent", label: "Wait agent", exposure: "model-only",
-    description: "Wait for a subagent/teammate to settle and return its final answer.",
-    parameters: Type.Object({ child_id: Type.String() }),
+    name: "interrupt_agent", label: "Interrupt agent", exposure: "model-only",
+    description: "Interrupt a running descendant's current turn and wait for it to settle. The child stays continuable via send_message. Accepts a child id or teammate name.",
+    parameters: Type.Object({ agent_id: Type.String() }),
     async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      try { const r = await subagents.wait(p.child_id); return text(`[${r.status}] ${r.text}`); }
-      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+      try {
+        const target = subagents.resolve(owner, resolveAgentRef(p));
+        if (!target) return errText(`Error: unknown agent ${resolveAgentRef(p)}`);
+        await subagents.interrupt(target.childId);
+        return text(`interrupt requested for agent ${target.childId}`);
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "list_agents", label: "List agents", exposure: "model-only",
+    description: "List subagents in this session tree from the catalog (no transcripts loaded). scope=children: direct children. scope=descendants: the whole tree in pre-order with parent and depth. Status running/live means a turn may be executing; settled rows show their outcome.",
+    parameters: Type.Object({ scope: Type.Optional(Type.Union([Type.Literal("children"), Type.Literal("descendants")])) }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const entries = p.scope === "descendants" ? subagents.descendants(owner) : subagents.childrenOf(owner);
+      const rows = entries.map((e) => {
+        const line = renderAgentLine(e, e.status === "live" && subagents.status(e.childId).running);
+        return p.scope === "descendants" ? `${line} parent=${e.parentId}` : line;
+      });
+      return text(rows.length ? rows.join("\n") : "(no subagents)");
+    },
+  });
+  pi.registerTool({
+    name: "agent_status", label: "Agent status", exposure: "model-only",
+    description: "Inspect one subagent in depth: status, depth, parent, model, elapsed, turns, tool calls, recent activity, latest text, structured result, and session file. Accepts a child id or teammate name.",
+    parameters: Type.Object({ agent_id: Type.String() }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try {
+        const target = subagents.resolve(owner, resolveAgentRef(p));
+        if (!target) return errText(`Error: unknown agent ${resolveAgentRef(p)}`);
+        const s = subagents.status(target.childId);
+        const e = s.entry;
+        const lines = [
+          renderAgentLine(e, s.running),
+          `parent=${e.parentId} role=${e.role}${e.name ? ` name=${e.name}` : ""} continuable=${e.continuable} elapsed=${Math.round(s.elapsedMs / 1000)}s turns=${e.turns} toolCalls=${e.toolCalls}`,
+          `cwd=${e.cwd}${e.sessionFile ? `\nsession=${e.sessionFile}` : ""}${e.preset ? `\npreset=${e.preset}` : ""}${e.thinkingLevel ? `\nthinking=${e.thinkingLevel}` : ""}`,
+        ];
+        if (s.activity.length > 0) lines.push(`recent activity:\n${s.activity.slice(-10).map((a) => `- ${a.text}`).join("\n")}`);
+        if (e.resultData !== undefined) lines.push(`structured result: ${JSON.stringify(e.resultData).slice(0, 4000)}`);
+        if (s.lastText) lines.push(`latest text:\n${s.lastText.slice(0, 2000)}`);
+        return text(lines.join("\n"));
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+
+  // ---- Agent teams (dsh experimental agent-team) ----
+  const persistTeam = () => { refreshUI(); try { pi.appendEntry(ENTRY.team, board.snapshot()); } catch { /* gone */ } };
+  board.onChange = () => persistTeam();
+  pi.registerTool({
+    name: "spawn_teammate", label: "Spawn teammate", exposure: "model-only",
+    description: "Create a named teammate (lead only). Names are permanent lowercase slugs, never reused. The teammate shares this workspace and the team task board, can message any member by name, and can claim board tasks. fork=true seeds it with your completed turns. Returns its id; results arrive as completion notices, or via wait_agent.",
+    parameters: Type.Object({
+      name: Type.String(), task: Type.String(), description: Type.Optional(Type.String()),
+      fork: Type.Optional(Type.Boolean()), model: Type.Optional(Type.String()), thinking_level: THINKING,
+      preset: Type.Optional(Type.String()), timeout_ms: Type.Optional(Type.Number()),
+    }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const name = String(p.name ?? "");
+      if (!/^[a-z][a-z0-9-]{0,31}$/.test(name)) return errText(`Error: invalid teammate name "${name}" (lowercase slug, max 32 chars)`);
+      if (subagents.nameTaken(owner, name)) return errText(`Error: teammate name "${name}" is already taken and names are never reused`);
+      const members = subagents.list(owner).filter((e) => e.role === "teammate").length;
+      if (members >= config.maxTeamMembers) return errText(`Error: TEAM_MEMBER_LIMIT: this team already has ${config.maxTeamMembers} teammates`);
+      const presetRes = resolvePreset(p.preset);
+      if ("error" in presetRes) return errText(`Error: ${presetRes.error}`);
+      const modelRes = resolveChildModel(ctx, p.model ?? presetRes.preset?.model);
+      if ("error" in modelRes) return errText(`Error: ${modelRes.error}`);
+      try {
+        const childId = await subagents.start({
+          provider: p.fork === true ? "fork" : "spawn", label: `team:${name}`, name, role: "teammate",
+          task: String(p.task), owner, cwd: ctx.cwd, model: modelRes.model, modelLabel: modelRes.label,
+          thinkingLevel: p.thinking_level ?? presetRes.preset?.thinkingLevel, preset: p.preset,
+          tools: presetRes.preset?.tools, timeoutMs: p.timeout_ms, delivery: "parent",
+          seedMessages: p.fork === true ? forkSeed(ctx) : undefined,
+          systemAppend: [p.description ? `Your role on the team: ${String(p.description)}` : "", presetRes.preset?.systemAppend ?? ""].filter(Boolean).join("\n\n") || undefined,
+        });
+        return text(`spawned teammate ${name}: ${childId}`);
+      } catch (e) {
+        subagents.recordFailed({ owner, name, label: `team:${name}`, role: "teammate", cwd: ctx.cwd, error: e instanceof Error ? e.message : String(e) });
+        refreshUI();
+        return errText(`Error: teammate ${name} failed to start: ${e instanceof Error ? e.message : String(e)} (recorded as failed; the name stays taken)`);
+      }
+    },
+  });
+  pi.registerTool({
+    name: "wait_agent", label: "Wait agent", exposure: "model-only",
+    description: "With agent_id: wait for that subagent/teammate to settle (up to timeout_ms) and return its status, final text, and structured result. Without agent_id: wait for the next team change (a settle, start, message, or task-board update), then re-read state with list_agents/team_task_list. Returns noProgress immediately when nothing is running.",
+    parameters: Type.Object({ agent_id: Type.Optional(Type.String()), timeout_ms: Type.Optional(Type.Number()) }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try {
+        if (p.agent_id) {
+          const target = subagents.resolve(owner, String(p.agent_id));
+          if (!target) return errText(`Error: unknown agent ${String(p.agent_id)}`);
+          const wait = subagents.wait(target.childId);
+          const r = p.timeout_ms !== undefined
+            ? await Promise.race([wait, new Promise<undefined>((res) => setTimeout(() => res(undefined), Math.min(Math.max(1, Number(p.timeout_ms)), 3_600_000)))])
+            : await wait;
+          if (r === undefined) return text(`timeout: agent ${target.childId} is still ${subagents.status(target.childId).running ? "running" : target.status}; wait again or keep working`);
+          return text(`[${r.status}${r.stopReason && r.stopReason !== r.status ? `/${r.stopReason}` : ""}] ${r.text}${r.data !== undefined ? `\nStructured result: ${JSON.stringify(r.data).slice(0, 8000)}` : ""}`);
+        }
+        if (!subagents.hasLive(owner)) return text("noProgress: no subagent is running; wake one with send_message or spawn one first");
+        const timeout = Math.min(Math.max(1000, Number(p.timeout_ms ?? 60_000)), 3_600_000);
+        const changed = await Promise.race([board.waitForChange(timeout), subagents.waitForChange(timeout)]);
+        return text(changed ? "changed: team state moved (agent settle/start/message or task-board update); re-read with list_agents and team_task_list" : "timeout: no team change within the wait window");
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     },
   });
   pi.registerTool({
     name: "team_task_create", label: "Team task create", exposure: "model-only",
-    description: "Create a durable shared team task.",
-    parameters: Type.Object({ subject: Type.String(), description: Type.Optional(Type.String()) }),
+    description: "Add a task to the durable shared team board. blockedBy: task ids that must complete before this is claimable. writeScopes: workspace-relative prefixes the task will modify (advisory overlap warnings).",
+    parameters: Type.Object({
+      subject: Type.String(), description: Type.Optional(Type.String()),
+      blockedBy: Type.Optional(Type.Array(Type.String())), writeScopes: Type.Optional(Type.Array(Type.String())),
+    }),
     async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      const t = { id: `task-${++teamSeq}`, subject: String(p.subject), description: String(p.description ?? ""), status: "pending" };
-      teamTasks.push(t); persistTeam();
-      return text(`created ${t.id}: ${t.subject}`);
+      try { return text(renderTeamTask(board.create("lead", p))); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     },
   });
   pi.registerTool({
     name: "team_task_list", label: "Team task list", exposure: "model-only",
-    description: "List durable shared team tasks with owners and statuses.",
+    description: "List durable shared team tasks with owner, revision, readiness, dependencies, and write-scope warnings.",
     parameters: Type.Object({}),
     async execute(_i: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      return text(teamTasks.length ? teamTasks.map((t) => `${t.id} [${t.status}]${t.owner ? ` @${t.owner}` : ""} ${t.subject}`).join("\n") : "No team tasks.");
+      const rows = board.list();
+      return text(rows.length ? rows.map(renderTeamTask).join("\n\n") : "No team tasks.");
     },
   });
   pi.registerTool({
     name: "team_task_get", label: "Team task get", exposure: "model-only",
-    description: "Read one team task in full.",
+    description: "Read one team task in full (note its revision before updating).",
     parameters: Type.Object({ task_id: Type.String() }),
     async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      const t = teamTasks.find((x) => x.id === p.task_id);
-      return t ? text(`${t.id} [${t.status}]${t.owner ? ` @${t.owner}` : ""}\n${t.subject}\n${t.description}`) : errText(`Error: unknown task ${p.task_id}`);
+      try { return text(renderTeamTask(board.get(String(p.task_id)))); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     },
   });
   pi.registerTool({
     name: "team_task_update", label: "Team task update", exposure: "model-only",
-    description: "Update a team task status (pending|in_progress|completed) and/or owner claim.",
-    parameters: Type.Object({ task_id: Type.String(), status: Type.Optional(Type.String()), owner: Type.Optional(Type.String()) }),
+    description: "Update a team task with compare-and-set (revision from team_task_get/list). Actions: claim, release, complete, reopen, assign (lead only, sets owner), delete, edit (subject/description/blockedBy/writeScopes). Stale revisions are rejected with TEAM_TASK_STALE_REVISION.",
+    parameters: Type.Object({
+      task_id: Type.String(), revision: Type.Number(),
+      action: Type.Union([Type.Literal("claim"), Type.Literal("release"), Type.Literal("complete"), Type.Literal("reopen"), Type.Literal("assign"), Type.Literal("delete"), Type.Literal("edit")]),
+      owner: Type.Optional(Type.String()), subject: Type.Optional(Type.String()), description: Type.Optional(Type.String()),
+      blockedBy: Type.Optional(Type.Array(Type.String())), writeScopes: Type.Optional(Type.Array(Type.String())),
+    }),
     async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      const t = teamTasks.find((x) => x.id === p.task_id);
-      if (!t) return errText(`Error: unknown task ${p.task_id}`);
-      if (p.status) t.status = String(p.status);
-      if (p.owner !== undefined) t.owner = String(p.owner);
-      persistTeam();
-      return text(`updated ${t.id}: [${t.status}]${t.owner ? ` @${t.owner}` : ""}`);
+      try {
+        return text(renderTeamTask(board.update("lead", true, {
+          taskId: String(p.task_id), expectedRevision: Number(p.revision), action: p.action as TeamTaskAction,
+          owner: p.owner, subject: p.subject, description: p.description, blockedBy: p.blockedBy, writeScopes: p.writeScopes,
+        })));
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     },
   });
 
@@ -845,7 +1003,7 @@ export default function (pi: any) {
         if (p.action === "complete") {
           g.status = "auditing"; g.revision++; persistGoal();
           const reviewerId = await subagents.start({
-            provider: "spawn", label: "goal-auditor", owner, cwd: ctx.cwd, model: ctx.model, delivery: "caller",
+            provider: "spawn", label: "goal-auditor", role: "auditor", owner, cwd: ctx.cwd, model: ctx.model, delivery: "caller",
             tools: ["read", "grep", "find", "ls", "bash", "structured_output"], requireStructured: true,
             outputSchema: {
               type: "object",
@@ -1032,18 +1190,33 @@ export default function (pi: any) {
       remember(ctx);
       const runWorkflow = async (jobSignal: AbortSignal, logLine: (s: string) => void) => {
         let started = 0;
+        // Queue workflow starts through the tree capacity instead of failing
+        // wide parallel() fan-outs: a slot is held for the child's lifetime.
+        const slots = new Semaphore(Math.max(1, config.maxActiveSubagents));
         const wf: Record<string, (a: any) => Promise<any>> = {
           agent: async (a: any) => {
             if (++started > 1000) throw new Error("workflow agent cap (1000) reached");
             const o = typeof a === "object" && a !== null ? a : { task: String(a) };
-            const childId = await subagents.start({
-              provider: "spawn", label: o.label ?? p.meta.name, task: o.task ?? o.prompt ?? "",
-              owner, cwd: ctx.cwd, model: ctx.model, delivery: "caller",
-              outputSchema: o.schema, requireStructured: o.requireStructured === true || o.schema !== undefined,
+            return slots.run(async () => {
+              try {
+                const presetRes = resolvePreset(o.preset);
+                if ("error" in presetRes) return null;
+                const modelRes = resolveChildModel(ctx, o.model ?? presetRes.preset?.model);
+                if ("error" in modelRes) return null;
+                const childId = await subagents.start({
+                  provider: "spawn", label: o.label ?? p.meta.name, task: o.task ?? o.prompt ?? "", role: "workflow",
+                  owner, cwd: o.cwd ? resolvePath(ctx, String(o.cwd)) : ctx.cwd,
+                  model: modelRes.model, modelLabel: modelRes.label,
+                  thinkingLevel: o.thinkingLevel ?? o.thinking_level ?? presetRes.preset?.thinkingLevel,
+                  preset: o.preset, tools: presetRes.preset?.tools, systemAppend: presetRes.preset?.systemAppend,
+                  timeoutMs: o.timeoutMs ?? o.timeout_ms, delivery: "caller",
+                  outputSchema: o.schema, requireStructured: o.requireStructured === true || o.schema !== undefined,
+                });
+                const res = await subagents.wait(childId);
+                if (res.status !== "completed") return null;
+                return res.data ?? res.text;
+              } catch { return null; }
             });
-            const res = await subagents.wait(childId);
-            if (res.status !== "completed") return null;
-            return res.data ?? res.text;
           },
           phase: async (t: any) => { logLine(`[phase] ${String(t)}`); return null; },
           log: async (t: any) => { logLine(String(t)); return null; },

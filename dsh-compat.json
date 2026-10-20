@@ -6,20 +6,214 @@
     "version": "0.2.1-rc.2",
     "tag": "dsh-v0.2.1-rc.2"
   },
-  "pi": { "tested": "1.3.0" },
+  "pi": {
+    "tested": "1.3.0"
+  },
   "areas": [
-    { "area": "Tasks", "status": "ported", "dshPackages": ["packages/todo/tool-todo", "packages/plan/plan-mode"], "piTools": ["todo_write", "exit_plan_mode"], "piCommands": ["plan", "todos"] },
-    { "area": "Goals", "status": "ported", "dshPackages": ["packages/goal/goal", "packages/goal/goal-round-driver", "packages/goal/tool-goal", "packages/goal/command-goal"], "piTools": ["create_goal", "get_goal", "update_goal"], "piCommands": ["goal"] },
-    { "area": "Guards", "status": "ported", "dshPackages": ["packages/guard/repeat-tool-reminder", "packages/guard/timeout-policy", "packages/fs/tool-fs"], "piTools": ["read_image"], "notes": "Repeat reminders 3/5/8; read-before-edit + stale-version; tool deadlines: timeout input caps on all tools, fused AbortSignal deadlines for nested executeTool calls, configurable top-level watchdog (toolTimeoutMs) that aborts and stamps TOOL_TIMEOUT. DSH timeout-policy is likewise cooperative (it cannot hard-stop a tool that ignores exec.signal); the residual Pi gap is that a model-issued foreign call's signal cannot be swapped per-call, so top-level enforcement aborts the turn, not just the call." },
-    { "area": "Context", "status": "ported", "dshPackages": ["packages/spill/spill-policy", "packages/compaction/compaction-tool-result-pruner"], "piTools": [] },
-    { "area": "Jobs", "status": "ported", "dshPackages": ["packages/jobs/jobs", "packages/jobs/jobs-local", "packages/jobs/tool-jobs", "packages/shell/tool-bash", "packages/sandbox/sandbox-policy", "packages/sandbox/sandbox-local"], "piTools": ["bash", "job_output", "job_list", "job_kill"], "piCommands": ["jobs"], "notes": "Sandbox: bubblewrap profile + escalation approval + cached functional probe + sandboxRunnerCommand override (DSH runnerCommand). DSH Linux fallback Landlock runner is not ported; bubblewrap only, fails closed." },
-    { "area": "Terminals", "status": "ported", "dshPackages": ["packages/terminal/terminal", "packages/experimental/tool-terminal", "packages/shell/tool-bash-persistent", "packages/shell/tool-pwsh"], "piTools": ["terminal_open", "terminal_send", "terminal_read", "terminal_list", "terminal_close", "terminal_signal", "terminal_resize", "bash_persistent"], "piCommands": ["terminals"], "notes": "Backends: node-pty, util-linux script, and tmux for durable=true. Durable tmux terminals survive a pi exit and reattach on restore; all terminals persist a transcript, and dead non-durable terminals restore as exited stubs (shell state cannot be resurrected). pwsh tools register only when a binary exists." },
-    { "area": "Subagents", "status": "partial", "dshPackages": ["packages/subagent/subagent", "packages/subagent/subagent-spawn-in-process", "packages/subagent/subagent-fork-in-process", "packages/subagent/tool-subagent", "packages/experimental/tool-agent-team"], "piTools": ["subagent", "subagent_fork", "send_message", "interrupt_agent", "list_agents", "spawn_teammate", "wait_agent", "team_task_create", "team_task_list", "team_task_get", "team_task_update"], "piCommands": ["agents"] },
-    { "area": "Subagent external providers", "status": "not-ported", "dshPackages": ["packages/subagent/subagent-claude-code", "packages/subagent/subagent-codex", "packages/subagent/subagent-acp"], "piTools": [], "notes": "Also list_subagent_models. Children run through the Pi SDK only." },
-    { "area": "PTC", "status": "ported", "dshPackages": ["packages/ptc-runtime/ptc-runtime", "packages/ptc-runtime/ptc-runtime-node", "packages/experimental/ptc-runtime-python"], "piTools": ["run_code"], "notes": "Plus a mossbed backend with no DSH equivalent." },
-    { "area": "Workflow", "status": "ported", "dshPackages": ["packages/workflow/workflow-ptc", "packages/workflow/tool-workflow"], "piTools": ["workflow"] },
-    { "area": "UI", "status": "partial", "dshPackages": ["packages/client/ui-goal", "packages/client/ui-jobs", "packages/client/ui-subagent", "packages/client/ui-plan"], "piTools": [], "piCommands": ["dsh", "todos", "jobs", "agents", "terminals", "goal"], "notes": "DSH ships web/desktop React panels. A Pi extension can draw footer status + string-array widgets, so pi-dsh renders goal/todos/jobs/agents-terminals-team widgets and a /dsh dashboard instead (src/ui.ts). No clickable panels, no graphs." },
-    { "area": "SSH sandbox", "status": "not-applicable", "dshPackages": ["packages/ssh/sandbox-ssh"], "piTools": [], "notes": "dsh-sandbox-ssh confines processes launched by DSH's SSH subprocess/filesystem providers through a remote helper. pi-dsh has no SSH transport to confine; porting the sandbox without an SSH execution feature would be dead code. Local bubblewrap is the applicable boundary." },
-    { "area": "Windows sandbox", "status": "not-applicable", "dshPackages": ["packages/sandbox/sandbox-windows-acl"], "piTools": [], "notes": "Out of scope by maintainer decision: pi-dsh is Linux-tested." }
+    {
+      "area": "Tasks",
+      "status": "ported",
+      "dshPackages": [
+        "packages/todo/tool-todo",
+        "packages/plan/plan-mode"
+      ],
+      "piTools": [
+        "todo_write",
+        "exit_plan_mode"
+      ],
+      "piCommands": [
+        "plan",
+        "todos"
+      ]
+    },
+    {
+      "area": "Goals",
+      "status": "ported",
+      "dshPackages": [
+        "packages/goal/goal",
+        "packages/goal/goal-round-driver",
+        "packages/goal/tool-goal",
+        "packages/goal/command-goal"
+      ],
+      "piTools": [
+        "create_goal",
+        "get_goal",
+        "update_goal"
+      ],
+      "piCommands": [
+        "goal"
+      ]
+    },
+    {
+      "area": "Guards",
+      "status": "ported",
+      "dshPackages": [
+        "packages/guard/repeat-tool-reminder",
+        "packages/guard/timeout-policy",
+        "packages/fs/tool-fs"
+      ],
+      "piTools": [
+        "read_image"
+      ],
+      "notes": "Repeat reminders 3/5/8; read-before-edit + stale-version; tool deadlines: timeout input caps on all tools, fused AbortSignal deadlines for nested executeTool calls, configurable top-level watchdog (toolTimeoutMs) that aborts and stamps TOOL_TIMEOUT. DSH timeout-policy is likewise cooperative (it cannot hard-stop a tool that ignores exec.signal); the residual Pi gap is that a model-issued foreign call's signal cannot be swapped per-call, so top-level enforcement aborts the turn, not just the call."
+    },
+    {
+      "area": "Context",
+      "status": "ported",
+      "dshPackages": [
+        "packages/spill/spill-policy",
+        "packages/compaction/compaction-tool-result-pruner"
+      ],
+      "piTools": []
+    },
+    {
+      "area": "Jobs",
+      "status": "ported",
+      "dshPackages": [
+        "packages/jobs/jobs",
+        "packages/jobs/jobs-local",
+        "packages/jobs/tool-jobs",
+        "packages/shell/tool-bash",
+        "packages/sandbox/sandbox-policy",
+        "packages/sandbox/sandbox-local"
+      ],
+      "piTools": [
+        "bash",
+        "job_output",
+        "job_list",
+        "job_kill"
+      ],
+      "piCommands": [
+        "jobs"
+      ],
+      "notes": "Sandbox: bubblewrap profile + escalation approval + cached functional probe + sandboxRunnerCommand override (DSH runnerCommand). DSH Linux fallback Landlock runner is not ported; bubblewrap only, fails closed."
+    },
+    {
+      "area": "Terminals",
+      "status": "ported",
+      "dshPackages": [
+        "packages/terminal/terminal",
+        "packages/experimental/tool-terminal",
+        "packages/shell/tool-bash-persistent",
+        "packages/shell/tool-pwsh"
+      ],
+      "piTools": [
+        "terminal_open",
+        "terminal_send",
+        "terminal_read",
+        "terminal_list",
+        "terminal_close",
+        "terminal_signal",
+        "terminal_resize",
+        "bash_persistent"
+      ],
+      "piCommands": [
+        "terminals"
+      ],
+      "notes": "Backends: node-pty, util-linux script, and tmux for durable=true. Durable tmux terminals survive a pi exit and reattach on restore; all terminals persist a transcript, and dead non-durable terminals restore as exited stubs (shell state cannot be resurrected). pwsh tools register only when a binary exists."
+    },
+    {
+      "area": "Subagents",
+      "status": "ported",
+      "dshPackages": [
+        "packages/subagent/subagent",
+        "packages/subagent/subagent-spawn-in-process",
+        "packages/subagent/subagent-fork-in-process",
+        "packages/subagent/tool-subagent",
+        "packages/experimental/tool-agent-team"
+      ],
+      "piTools": [
+        "subagent",
+        "subagent_fork",
+        "send_message",
+        "interrupt_agent",
+        "list_agents",
+        "agent_status",
+        "list_subagent_models",
+        "spawn_teammate",
+        "wait_agent",
+        "team_task_create",
+        "team_task_list",
+        "team_task_get",
+        "team_task_update"
+      ],
+      "piCommands": [
+        "agents"
+      ],
+      "notes": "Tree-wide capacity (8), maxSubagentDepth (default 1) with child-visible delegation tools below the cap, adjacent messaging both directions with messageIds, per-child model/thinking/preset selection, timeouts, progress/activity via agent_status, descriptor-persisted catalog (result replay + cold resume after restart), and the agent-team board (CAS revisions, blockedBy readiness, writeScope overlap warnings, wait-for-change) visible to teammates as scoped tools. Deltas: presets are pi-dsh config objects, not DSH preset-registry compositions; interrupt waits for settle instead of returning on acceptance; child bash is stock Pi bash (no owned jobs/sandbox in children); team state is one board per root session persisted as session entries."
+    },
+    {
+      "area": "Subagent external providers",
+      "status": "not-ported",
+      "dshPackages": [
+        "packages/subagent/subagent-claude-code",
+        "packages/subagent/subagent-codex",
+        "packages/subagent/subagent-acp"
+      ],
+      "piTools": [],
+      "notes": "Also list_subagent_models. Children run through the Pi SDK only."
+    },
+    {
+      "area": "PTC",
+      "status": "ported",
+      "dshPackages": [
+        "packages/ptc-runtime/ptc-runtime",
+        "packages/ptc-runtime/ptc-runtime-node",
+        "packages/experimental/ptc-runtime-python"
+      ],
+      "piTools": [
+        "run_code"
+      ],
+      "notes": "Plus a mossbed backend with no DSH equivalent."
+    },
+    {
+      "area": "Workflow",
+      "status": "ported",
+      "dshPackages": [
+        "packages/workflow/workflow-ptc",
+        "packages/workflow/tool-workflow"
+      ],
+      "piTools": [
+        "workflow"
+      ]
+    },
+    {
+      "area": "UI",
+      "status": "partial",
+      "dshPackages": [
+        "packages/client/ui-goal",
+        "packages/client/ui-jobs",
+        "packages/client/ui-subagent",
+        "packages/client/ui-plan"
+      ],
+      "piTools": [],
+      "piCommands": [
+        "dsh",
+        "todos",
+        "jobs",
+        "agents",
+        "terminals",
+        "goal"
+      ],
+      "notes": "DSH ships web/desktop React panels. A Pi extension can draw footer status + string-array widgets, so pi-dsh renders goal/todos/jobs/agents-terminals-team widgets and a /dsh dashboard instead (src/ui.ts). No clickable panels, no graphs."
+    },
+    {
+      "area": "SSH sandbox",
+      "status": "not-applicable",
+      "dshPackages": [
+        "packages/ssh/sandbox-ssh"
+      ],
+      "piTools": [],
+      "notes": "dsh-sandbox-ssh confines processes launched by DSH's SSH subprocess/filesystem providers through a remote helper. pi-dsh has no SSH transport to confine; porting the sandbox without an SSH execution feature would be dead code. Local bubblewrap is the applicable boundary."
+    },
+    {
+      "area": "Windows sandbox",
+      "status": "not-applicable",
+      "dshPackages": [
+        "packages/sandbox/sandbox-windows-acl"
+      ],
+      "piTools": [],
+      "notes": "Out of scope by maintainer decision: pi-dsh is Linux-tested."
+    }
   ]
 }

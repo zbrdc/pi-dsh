@@ -4,7 +4,7 @@
  * equivalents within what a Pi extension can draw). No Pi imports: unit-testable. */
 import type { Goal, TodoItem } from "./core.ts";
 import type { JobSnapshot } from "./jobs.ts";
-import type { CatalogEntry } from "./subagent.ts";
+import { renderAgentLine, type CatalogEntry } from "./subagent.ts";
 
 export interface TerminalRow { id: string; label: string; alive: boolean; backend: string }
 export interface TeamTaskRow { id: string; subject: string; status: string; owner?: string }
@@ -74,14 +74,14 @@ export function renderAgentsWidget(state: UiState, maxLines = 8): string[] | und
   const settled = state.agents.length - live.length;
   if (state.agents.length > 0) {
     lines.push(`🤖 Agents (${live.length} live${settled ? `, ${settled} settled` : ""})`);
-    for (const a of live) lines.push(`▶ ${a.childId} [${a.provider}] ${clip(a.label, 48)}`);
+    for (const a of live) lines.push(`▶ ${clip(renderAgentLine(a, false), 96)}`);
   }
   const aliveTerms = state.terminals.filter((t) => t.alive);
   if (state.terminals.length > 0) {
     lines.push(`🖥 Terminals (${aliveTerms.length} alive)`);
     for (const t of aliveTerms) lines.push(`▶ ${t.id} [${t.backend}] ${clip(t.label, 48)}`);
   }
-  const openTeam = state.teamTasks.filter((t) => t.status !== "completed");
+  const openTeam = state.teamTasks.filter((t) => t.status !== "completed" && t.status !== "deleted");
   if (openTeam.length > 0) {
     lines.push(`👥 Team (${openTeam.length} open)`);
     for (const t of openTeam) lines.push(`○ ${t.id} [${t.status}]${t.owner ? ` @${t.owner}` : ""} ${clip(t.subject, 44)}`);

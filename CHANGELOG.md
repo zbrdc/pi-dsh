@@ -2,6 +2,17 @@
 
 All notable changes to pi-dsh will be documented in this file.
 
+## Unreleased
+
+- Subagents in depth, modeled on DSH `dsh-subagent` + experimental agent-team:
+  - Delegation depth budget (`maxSubagentDepth`, default 1): below the cap, children receive scoped `subagent`/`subagent_fork`/`send_message`/`interrupt_agent`/`list_agents` tools; direct parents receive completion steers.
+  - Adjacent messaging both directions with sender framing and messageIds (child → parent/`lead`, parent → descendants, teammate → teammate); non-adjacent sends are rejected.
+  - Per-child model routes (`model`, `list_subagent_models`, `subagentModels` allowlist), `thinking_level`, spawn presets (`subagentPresets`), `timeout_ms`/`subagentTimeoutMs` deadlines with stop reasons, and schema-led delegation from plain `subagent` (`output_schema`).
+  - Descriptor-persisted catalog: settled results replay via `wait_agent` after restart and `send_message` cold-resumes from the saved child session.
+  - `agent_status` (liveness, turns, tool calls, activity, latest text) and `list_agents` descendants scope. Workflow `agent()` queues through tree capacity and accepts model/preset/timeout options.
+  - Teams reworked: permanent names with failed-provisioning records, fork teammates, and a durable CAS task board (`blockedBy` readiness, `writeScopes` overlap warnings, claim/release/assign lifecycle) exposed to teammates themselves. `wait_agent` can wait for the next team change.
+  - Breaking: `team_task_update` now requires `action` + `revision` (compare-and-set) instead of free-form status/owner writes; `send_message`/`interrupt_agent`/`wait_agent` take `agent_id` (child id or teammate name).
+
 ## 0.2.0 - 2026-10-20
 
 - Rich UI: goal, todo, jobs, and agents/terminals/team widgets plus a combined status line, refreshed on every state change; `/dsh` dashboard and `/todos`, `/jobs`, `/agents`, `/terminals` views with kill/close actions.

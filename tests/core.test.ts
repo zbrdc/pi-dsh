@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs, resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, tmuxSessionName, tmuxSendKeysChunks } from "../src/core.ts";
+import { validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs, resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, tmuxSessionName, tmuxSendKeysChunks, parseOutputSchema } from "../src/core.ts";
 import { JobRegistry } from "../src/jobs.ts";
 import { capLines, renderAgentsWidget, renderDashboard, renderJobsWidget, renderStatusLine, renderTodoWidget } from "../src/ui.ts";
 import { TerminalRegistry, tmuxAvailable } from "../src/terminal.ts";
@@ -8,7 +8,8 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { NodePtcProvider, MossbedProvider } from "../src/ptc.ts";
-import { buildChildPrompt, structuredToolParameters } from "../src/subagent.ts";
+import { buildChildPrompt, structuredToolParameters, SubagentManager } from "../src/subagent.ts";
+import { TeamBoard, scopesOverlap } from "../src/team.ts";
 
 test("todo validation", () => {
   assert.equal(validateTodos([{ content: "a", status: "pending" }], true).length, 1);
@@ -251,7 +252,7 @@ test("ui widgets render bounded goal/todo/jobs/agents state", () => {
       { content: "live thing", status: "in_progress" as const },
     ],
     jobs: [{ id: "bash-1", kind: "bash", label: "sleep", status: "running" as const, startedAt: now - 5000 }],
-    agents: [{ childId: "c1", provider: "spawn", label: "audit", owner: "o", cwd: "/tmp", createdAt: now, status: "live" as const }],
+    agents: [{ childId: "c1", provider: "spawn", label: "audit", owner: "o", parentId: "o", depth: 1, role: "child" as const, continuable: true, toolCalls: 0, turns: 0, cwd: "/tmp", createdAt: now, status: "live" as const }],
     terminals: [{ id: "term-1", label: "bash", alive: true, backend: "tmux" }],
     teamTasks: [{ id: "task-1", subject: "Review", status: "pending" }],
   };
@@ -313,4 +314,181 @@ test("durable tmux terminal survives dispose and reattaches on restore", async (
   } finally {
     await reg.disposeOwner(owner).catch(() => undefined);
   }
+});
+
+test("team board: CAS, dependency readiness, claim lifecycle, overlap warnings", async () => {
+  const board = new TeamBoard(8);
+  let changes = 0;
+  board.onChange = () => { changes++; };
+  const a = board.create("lead", { subject: "Build API", writeScopes: ["src/api"] });
+  const b = board.create("lead", { subject: "Wire UI", blockedBy: [a.id], writeScopes: ["src/api/client.ts"] });
+  assert.equal(a.ready, true);
+  assert.equal(b.ready, false);
+  assert.throws(() => board.update("rev", false, { taskId: b.id, expectedRevision: 1, action: "claim" }), /blocked by incomplete/);
+  assert.throws(() => board.update("rev", false, { taskId: a.id, expectedRevision: 9, action: "claim" }), /TEAM_TASK_STALE_REVISION/);
+  const claimed = board.update("rev", false, { taskId: a.id, expectedRevision: 1, action: "claim" });
+  assert.equal(claimed.status, "in_progress");
+  assert.equal(claimed.owner, "rev");
+  assert.throws(() => board.update("other", false, { taskId: a.id, expectedRevision: 2, action: "complete" }), /only its owner or the lead/);
+  board.update("rev", false, { taskId: a.id, expectedRevision: 2, action: "complete" });
+  assert.equal(board.get(b.id).ready, true);
+  const waitChanged = board.waitForChange(5000);
+  const claimedB = board.update("ui", false, { taskId: b.id, expectedRevision: 1, action: "claim" });
+  assert.equal(await waitChanged, true);
+  // Overlap: another in-progress task touching src/api warns on both views.
+  const c = board.create("lead", { subject: "API tests", writeScopes: ["src/api"] });
+  board.update("qa", false, { taskId: c.id, expectedRevision: 1, action: "claim" });
+  assert.ok(board.get(b.id).writeScopeWarnings.some((w) => w.includes(c.id)));
+  assert.ok(board.get(c.id).writeScopeWarnings.some((w) => w.includes(b.id)));
+  assert.equal(scopesOverlap("src/api", "src/apix"), false);
+  board.update("lead", true, { taskId: c.id, expectedRevision: board.get(c.id).revision, action: "edit", blockedBy: [b.id] });
+  assert.throws(() => board.update("lead", true, { taskId: b.id, expectedRevision: board.get(b.id).revision, action: "edit", blockedBy: [c.id] }), /cycle/);
+  board.update("lead", true, { taskId: c.id, expectedRevision: board.get(c.id).revision, action: "delete" });
+  assert.equal(board.list().some((t) => t.id === c.id), false);
+  assert.ok(changes >= 5);
+  // Restore migrates the legacy shape.
+  const fresh = new TeamBoard();
+  fresh.restore([{ id: "task-3", subject: "old", description: "", status: "pending", owner: "x" } as any]);
+  assert.equal(fresh.get("task-3").revision, 1);
+  assert.equal(fresh.create("lead", { subject: "next" }).id, "task-4");
+});
+
+function makeFakeChildren() {
+  const created: Array<{ opts: any; handle: any }> = [];
+  const state = { auto: false, seq: 0 };
+  const factory = async (opts: any) => {
+    const id = `fake-${++state.seq}`;
+    const handle: any = {
+      sessionId: id, sessionFile: `/tmp/${id}.jsonl`, prompts: [] as string[], steers: [] as string[], followUps: [] as string[],
+      structuredValue: undefined, listeners: [] as Array<(e: any) => void>, streaming: false, release: undefined as undefined | (() => void),
+      prompt: async (t: string) => {
+        handle.prompts.push(t); handle.streaming = true;
+        for (const f of handle.listeners) f({ type: "tool_execution_start", toolName: "bash", args: { command: "ls" } });
+        await new Promise<void>((r) => { handle.release = r; if (state.auto) r(); });
+        handle.streaming = false;
+      },
+      steer: async (t: string) => { handle.steers.push(t); },
+      followUp: async (t: string) => { handle.followUps.push(t); },
+      abort: async () => { handle.release?.(); },
+      isStreaming: () => handle.streaming,
+      lastText: () => `last:${handle.prompts.at(-1) ?? ""}`,
+      structured: () => handle.structuredValue,
+      subscribe: (fn: (e: any) => void) => { handle.listeners.push(fn); return () => undefined; },
+      dispose: () => undefined,
+    };
+    created.push({ opts, handle });
+    return handle;
+  };
+  return { created, state, factory };
+}
+
+test("subagent manager: tree capacity, depth cap, nested delegation tools", async () => {
+  const board = new TeamBoard();
+  const { created, factory } = makeFakeChildren();
+  const mgr = new SubagentManager({ maxActive: 2, maxDepth: 2, childDir: "/tmp", createChild: factory as any, board });
+  const aId = await mgr.start({ provider: "spawn", label: "a", task: "task-a", owner: "root", cwd: "/tmp", delivery: "parent" });
+  assert.equal(mgr.get(aId)?.depth, 1);
+  assert.equal(mgr.status(aId).entry.toolCalls, 1); // progress subscription saw the tool event
+  const childTools = created[0]!.opts.extraTools as any[];
+  const spawnTool = childTools.find((t) => t.name === "subagent");
+  assert.ok(spawnTool, "depth-1 child gets delegation tool when maxDepth=2");
+  const ctx: any = { cwd: "/tmp", sessionManager: { getBranch: () => [] } };
+  const started = await spawnTool.execute("t1", { task: "grandchild task" }, undefined, undefined, ctx);
+  const gId = started.content[0].text.replace("started subagent ", "");
+  assert.equal(mgr.get(gId)?.depth, 2);
+  assert.equal(mgr.get(gId)?.parentId, aId);
+  const grandchildTools = created[1]!.opts.extraTools as any[];
+  assert.equal(grandchildTools.some((t) => t.name === "subagent"), false); // at cap: no delegation tools
+  await assert.rejects(() => mgr.start({ provider: "spawn", label: "c", task: "x", owner: "root", cwd: "/tmp", delivery: "parent" }), /ACTIVATION_LIMIT_REACHED/);
+  await assert.rejects(() => mgr.start({ provider: "spawn", label: "d", task: "x", owner: "root", parentId: gId, depth: 3, cwd: "/tmp", delivery: "parent" }), /exceeds maxDepth/);
+  assert.deepEqual(mgr.descendants("root").map((e) => e.childId), [aId, gId]);
+  created[1]!.handle.release();
+  const gRes = await mgr.wait(gId);
+  assert.equal(gRes.status, "completed");
+  assert.ok(created[0]!.handle.steers.some((s: string) => s.includes("finished")), "direct parent child receives completion steer");
+  created[0]!.handle.release();
+  await mgr.wait(aId);
+});
+
+test("subagent manager: adjacency messaging, team sibling messaging, timeout", async () => {
+  const board = new TeamBoard();
+  const { created, state, factory } = makeFakeChildren();
+  const mgr = new SubagentManager({ maxActive: 8, maxDepth: 1, childDir: "/tmp", createChild: factory as any, board });
+  const parentNotes: string[] = [];
+  mgr.onParentMessage = (_from, message) => parentNotes.push(message);
+  const t1 = await mgr.start({ provider: "spawn", label: "team:rev", name: "rev", role: "teammate", task: "review", owner: "root", cwd: "/tmp", delivery: "parent" });
+  const t2 = await mgr.start({ provider: "spawn", label: "team:qa", name: "qa", role: "teammate", task: "test", owner: "root", cwd: "/tmp", delivery: "parent" });
+  const plain = await mgr.start({ provider: "spawn", label: "plain", task: "solo", owner: "root", cwd: "/tmp", delivery: "parent" });
+  const t1Tools = created[0]!.opts.extraTools as any[];
+  assert.ok(t1Tools.some((t) => t.name === "team_task_create"), "teammate receives board tools");
+  assert.equal((created[2]!.opts.extraTools as any[]).some((t) => t.name === "team_task_create"), false);
+  const send = t1Tools.find((t) => t.name === "send_message");
+  const toQa = await send.execute("m1", { agent_id: "qa", message: "diff is ready" });
+  assert.match(toQa.content[0].text, /message delivered to agent/);
+  assert.ok(created[1]!.handle.steers.some((s: string) => s.includes("diff is ready") && s.includes("rev")));
+  const toLead = await send.execute("m2", { agent_id: "lead", message: "blocked on fixtures" });
+  assert.match(toLead.content[0].text, /delivered to lead/);
+  assert.deepEqual(parentNotes, ["blocked on fixtures"]);
+  await assert.rejects(() => send.execute("m3", { agent_id: plain, message: "hi" }), /may only message/);
+  // Child-visible board write lands on the shared board.
+  const create = t1Tools.find((t) => t.name === "team_task_create");
+  await create.execute("b1", { subject: "Review diff", writeScopes: ["src"] });
+  assert.equal(board.list().at(-1)?.createdBy, "rev");
+  // auto stays false: the timed child's prompt hangs until the deadline aborts it.
+  const timed = await mgr.start({ provider: "spawn", label: "slow", task: "hang", owner: "root", cwd: "/tmp", delivery: "caller", timeoutMs: 10 });
+  const timedRes = await mgr.wait(timed);
+  assert.equal(timedRes.stopReason, "timeout");
+  assert.equal(timedRes.status, "killed");
+  for (const c of created) c.handle.release?.();
+  await Promise.allSettled([mgr.wait(t1), mgr.wait(t2), mgr.wait(plain)]);
+});
+
+test("subagent manager: restore stubs replay results and cold-resume after restart", async () => {
+  const { created, state, factory } = makeFakeChildren();
+  state.auto = true;
+  const mgr = new SubagentManager({ maxActive: 8, maxDepth: 1, childDir: "/tmp", createChild: factory as any });
+  const id = await mgr.start({ provider: "spawn", label: "worker", task: "first", owner: "root", cwd: "/tmp", delivery: "parent", modelLabel: "prov/model" });
+  const first = await mgr.wait(id);
+  assert.equal(first.status, "completed");
+  const catalog = mgr.list("root");
+  const mgr2 = new SubagentManager({ maxActive: 8, maxDepth: 1, childDir: "/tmp", createChild: factory as any });
+  mgr2.restore(catalog);
+  const replayed = await mgr2.wait(id);
+  assert.equal(replayed.text, first.text);
+  const before = created.length;
+  const ack = await mgr2.sendMessageAs("root", id, "second task");
+  assert.match(ack, /resumed/);
+  assert.equal(created[before]!.opts.openFile, `/tmp/${id}.jsonl`);
+  assert.equal(created[before]!.opts.thinkingLevel, undefined);
+  const second = await mgr2.wait(created[before]!.handle.sessionId);
+  assert.match(second.text, /second task/);
+});
+
+test("subagent manager: required structured output fails silent children", async () => {
+  const { state, factory } = makeFakeChildren();
+  state.auto = true;
+  const mgr = new SubagentManager({ maxActive: 8, maxDepth: 1, childDir: "/tmp", createChild: factory as any });
+  const id = await mgr.start({ provider: "spawn", label: "auditor", task: "audit", owner: "root", cwd: "/tmp", delivery: "caller", requireStructured: true });
+  const res = await mgr.wait(id);
+  assert.equal(res.status, "failed");
+});
+
+test("subagent manager: restore never clobbers a live activation", async () => {
+  const { created, factory } = makeFakeChildren();
+  const mgr = new SubagentManager({ maxActive: 8, maxDepth: 1, childDir: "/tmp", createChild: factory as any });
+  const id = await mgr.start({ provider: "spawn", label: "live", task: "hang", owner: "root", cwd: "/tmp", delivery: "parent" });
+  mgr.restore(mgr.list("root")); // session_tree-style re-restore from the branch snapshot
+  assert.equal(mgr.get(id)?.status, "live");
+  created[0]!.handle.release();
+  const res = await mgr.wait(id);
+  assert.equal(res.status, "completed");
+});
+
+test("parseOutputSchema accepts object and stringified schema (live regression)", () => {
+  assert.equal(parseOutputSchema(undefined), undefined);
+  assert.deepEqual(parseOutputSchema({ type: "object" }), { type: "object" });
+  assert.deepEqual(parseOutputSchema('{"type":"object","properties":{"contents":{"type":"string"}}}'), { type: "object", properties: { contents: { type: "string" } } });
+  assert.throws(() => parseOutputSchema("{not json"), /not valid JSON/);
+  assert.throws(() => parseOutputSchema('"just a string"'), /must be a JSON Schema object/);
+  assert.throws(() => parseOutputSchema([1, 2]), /must be a JSON Schema object/);
 });

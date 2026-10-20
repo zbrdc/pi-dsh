@@ -147,3 +147,30 @@ test("dsh-compat manifest matches registered tools and commands", async () => {
     for (const cmd of area.piCommands ?? []) assert.ok(h.commands.has(cmd), `${area.area}: command /${cmd} registered`);
   }
 });
+
+test("subagent v2 surface: model/preset/schema params, status and model tools, CAS team tools", async () => {
+  const h = makeHarness("tui", true);
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  for (const name of ["list_subagent_models", "agent_status", "subagent", "spawn_teammate", "wait_agent"]) assert.ok(h.tools.has(name), name);
+  const delegateSchema = JSON.stringify(h.tools.get("subagent").parameters);
+  for (const field of ["model", "thinking_level", "preset", "timeout_ms", "output_schema", "require_structured"]) assert.ok(delegateSchema.includes(`"${field}"`), field);
+  const listSchema = JSON.stringify(h.tools.get("list_agents").parameters);
+  assert.ok(listSchema.includes('"scope"'));
+  // Team board CAS through the real tools.
+  const created = await h.tools.get("team_task_create").execute("1", { subject: "Ship v2", writeScopes: ["src"] }, undefined, undefined, h.ctx);
+  assert.match(created.content[0].text, /rev=1/);
+  const taskId = created.content[0].text.match(/^(task-\d+)/)[1];
+  const stale = await h.tools.get("team_task_update").execute("2", { task_id: taskId, revision: 99, action: "claim" }, undefined, undefined, h.ctx);
+  assert.equal(stale.isError, true);
+  assert.match(stale.content[0].text, /TEAM_TASK_STALE_REVISION/);
+  const assigned = await h.tools.get("team_task_update").execute("3", { task_id: taskId, revision: 1, action: "assign", owner: "rev" }, undefined, undefined, h.ctx);
+  assert.match(assigned.content[0].text, /@rev/);
+  assert.match(assigned.content[0].text, /in_progress/);
+  // wait_agent without a target reports noProgress when nothing runs.
+  const noProgress = await h.tools.get("wait_agent").execute("4", {}, undefined, undefined, h.ctx);
+  assert.match(noProgress.content[0].text, /noProgress/);
+  // Unknown model route fails before any child starts.
+  const badModel = await h.tools.get("subagent").execute("5", { task: "x", model: "nope/missing" }, undefined, undefined, h.ctx);
+  assert.equal(badModel.isError, true);
+  assert.match(badModel.content[0].text, /unknown subagent model route/);
+});

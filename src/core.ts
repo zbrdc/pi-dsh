@@ -152,6 +152,16 @@ export function renderGoalRound(goal: Goal, round: number): string {
   return `<goal_round>\nObjective: ${JSON.stringify(goal.objective)}\nRound: ${round}/${goal.maxGoalRounds}\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal with get_goal, and call update_goal to mark it complete (an auditor will verify). If work remains, leave the goal active for the next round. Report a blocker only with a concrete blocker string.\n</goal_round>`;
 }
 
+/** Parse an output_schema argument: models often pass the schema as a JSON
+ * string instead of an object (observed live). Returns the schema object,
+ * undefined when absent, and throws on anything else. */
+export function parseOutputSchema(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined || value === null) return undefined;
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown; } catch { throw new Error("output_schema is not valid JSON"); } })() : value;
+  if (typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("output_schema must be a JSON Schema object");
+  return parsed as Record<string, unknown>;
+}
+
 /** Normalize a structured-output submission: models often stringify the object.
  * A JSON string that parses to an object/array becomes that value; anything else stays as-is. */
 export function normalizeStructured(value: unknown): unknown {

@@ -17,13 +17,17 @@ Pi-dsh is a semantic reimplementation for Pi APIs, not a line-by-line source por
 | Jobs | `job_output/list/kill`, owned `bash` (background promotion, bwrap sandbox + escalation approval), durable output files, completion wakes with caps | jobs, tool-jobs, tool-bash, sandbox-policy |
 | Terminals | `terminal_open/send/read/list/close/signal/resize`, `bash_persistent`, `pwsh(_persistent)` when a binary exists; `durable: true` runs in detached tmux and reattaches after a Pi restart | terminal, tool-terminal, tool-bash-persistent |
 | UI | widgets for goal, todos, jobs, agents/terminals/team + combined status line; `/dsh` dashboard, `/todos`, `/jobs` (kill), `/agents`, `/terminals` (close) | client/ui-goal, ui-jobs, ui-subagent, ui-plan |
-| Subagents | `subagent`, `subagent_fork` (explicit completed-turn seed), `send_message`, `interrupt_agent`, `list_agents`, required structured output, capacity 8/tree; teams: `spawn_teammate`, `wait_agent`, `team_task_*` | subagent, spawn/fork, experimental tool-agent-team |
+| Subagents | `subagent`, `subagent_fork` (explicit completed-turn seed) with per-child `model`, `thinking_level`, `preset`, `timeout_ms`, `output_schema`; `send_message` (adjacent, both directions, messageIds), `interrupt_agent`, `list_agents` (children/descendants), `agent_status`, `list_subagent_models`; capacity 8/tree, depth cap (`maxSubagentDepth`), cold resume after restart; teams: `spawn_teammate`, `wait_agent` (settle or next team change), CAS `team_task_*` board visible to teammates | subagent, spawn/fork, tool-subagent(-control), experimental agent-team |
 | PTC | `run_code` with schema-typed SDK, 10-way sub-call scheduler, image results; Node (per-call/persistent REPL retaining declarations), Python, and mossbed backends | ptc-runtime(-node), ptc-runtime-python, dsh-tools PTC mode |
 | Workflow | `workflow` (`agent`/`parallel`/`pipeline`/`phase`/`log`), background as a job | workflow-ptc, tool-workflow |
 
 State (todos, plan, goal, subagent catalog, team tasks) persists as session custom entries and restores on the active branch. A standing `pi_dsh` system-prompt section carries the cross-tool operating rules plus a bounded snapshot of the current goal and unfinished todos; mid-run state changes are surfaced once as a hidden control refresh so they survive long turns and compaction boundaries. Job snapshots and output persist under `~/.pi/agent/pi-dsh/jobs/`; durable bash jobs write output/exit files under `<workspace>/.pi-dsh/jobs/`, keep running detached across a pi exit, and reconcile on restore (an exit file proves completion; missing evidence fails the job honestly). Terminal metadata and transcripts persist under `~/.pi/agent/pi-dsh/terminals/`: durable (tmux) terminals reattach live on restore, while non-durable PTYs restore as exited stubs whose transcripts stay readable — a dead shell's state cannot be resurrected.
 
 Subagent children run through the pi SDK with no user-extension discovery, but they do load pi-dsh's inline child policy: the same read-before-edit/stale-version blocks, repeat-call reminders, spill, and old-tool-result pruning. Their system prompt includes the delegated-subagent contract, exact structured-output instruction when required, and a warning that inherited references to unavailable parent tools do not apply. Fork seeds only the parent's completed-turn prefix. Schema-led runs pass the exact output schema to `structured_output`; generic capture preserves sibling verdict fields beside an evidence object.
+
+Subagents in depth: capacity is 8 live activations across the whole session tree (starts reject with `ACTIVATION_LIMIT_REACHED`; workflow `parallel()` queues through the same capacity instead of failing). Delegation depth is capped by `maxSubagentDepth` (default 1, as in DSH): below the cap, children receive their own scoped `subagent`/`subagent_fork`/`send_message`/`interrupt_agent`/`list_agents` tools, so raise the cap (e.g. 2–3) for hierarchical delegation. Messaging is adjacent — a child can reach its direct parent (or `"lead"`), its direct children, or any teammate — framed with sender attribution and a messageId, returning acceptance only. Each activation records a descriptor (parent, depth, role, model route, thinking level, preset, tools, session file, stored result) in the session catalog: after a Pi restart, settled children replay their stored result through `wait_agent` and cold-resume from their session file on `send_message`. `agent_status` reports liveness, elapsed time, turns, tool calls, recent activity, and latest text; `subagentTimeoutMs` or per-call `timeout_ms` aborts a child at its deadline (`stopReason: timeout`). Models are selected per child by `provider/modelId` route (discover via `list_subagent_models`; restrict with `subagentModels`), and `subagentPresets` in config define reusable spawn compositions (prompt append, builtin tool subset, model, thinking level) chosen per call with `preset`.
+
+Teams (DSH experimental agent-team shape): `spawn_teammate` creates a permanently named teammate (fresh or forked; failed provisioning keeps the name as a `failed` roster entry). Teammates share the workspace and receive the same team tools as the lead, scoped to their identity: peer `send_message` by name, roster via `list_agents`, and the durable task board. Board tasks are versioned snapshots updated compare-and-set (`TEAM_TASK_STALE_REVISION` on a stale write), claimable only when their `blockedBy` dependencies are complete, with advisory `writeScopes` overlap warnings between in-progress tasks. `wait_agent` with no target waits for the next team change instead of polling. Only the lead spawns or interrupts teammates.
 
 PTC backends: Node (default) runs model code in a child process, optionally under bubblewrap; Python (`backend: "python"`) runs statements in CPython (assign `result`, call `tools.<name>(dict)`); Mossbed (`backend: "mossbed"`) runs JS in the tardigrade sandbox. On every backend `tools.*` re-enters pi through `ctx.executeTool` (for mossbed, through a per-run loopback bridge granted to the guest by name only — the URL and token stay operator-side; results over ~900 KB exceed the net budget and must be narrowed). Persistent Node mode (`persistentPtc`) retains top-level declarations across calls; redeclarating a `const` fails.
 
@@ -86,7 +90,13 @@ Optional config at `~/.pi/agent/pi-dsh.json` (defaults shown). A starter file is
   "toolTimeoutMs": null,
   "defaultToolTimeoutMs": null,
   "toolTimeoutAction": "abort",
-  "durableTerminals": false
+  "durableTerminals": false,
+  "maxSubagentDepth": 1,
+  "subagentTimeoutMs": null,
+  "subagentModels": null,
+  "subagentPresets": null,
+  "maxTeamMembers": 16,
+  "maxTeamTasks": 256
 }
 ```
 
@@ -104,11 +114,11 @@ Mossbed isolates pure JS/WASM compute, but its optional bridge intentionally let
 
 - Deadlines are cooperative, exactly as in DSH (its timeout-policy cannot hard-stop a tool that ignores `exec.signal` either). The remaining Pi-specific gap: an extension cannot swap the abort signal of a single model-issued foreign call, so a top-level watchdog abort ends the turn rather than only that call. Nested `run_code` calls do get per-call deadline signals.
 - Non-durable PTY shells die with the Pi process; only their transcripts survive. Use `terminal_open` with `durable: true` (tmux) for terminals that must outlive Pi.
-- In print/json mode there is no dialog surface: `exit_plan_mode` auto-approves and sandbox widening is denied. `/plan <task>` itself works — the task is persisted and injected into the next turn.
+- In print/json mode there is no dialog surface: `exit_plan_mode` auto-approves and sandbox widening is denied. `/plan <task>` itself works — the task is persisted and injected into the next turn. Print mode also exits when the parent turn ends, so fire-and-forget subagents are aborted at shutdown unless the parent collects them with `wait_agent` (or runs them through `workflow`) before finishing; completion notices need a live (interactive) session.
 - UI is status + text widgets and notify dashboards, not DSH's web panels. Pi's extension API has no richer persistent panel surface.
 - Sandbox is bubblewrap(-compatible) only on Linux; DSH's Landlock fallback runner, SSH sandbox (no SSH transport exists here), and Windows ACL runner are not ported.
 - Persistent PTC declarations in a `return`-style evaluation do not outlive that call (write declarations without `return` to keep them).
-- External subagent providers (Claude Code, Codex, ACP) and `list_subagent_models` are not ported yet.
+- External subagent providers (Claude Code, Codex, ACP) are not ported; children always run through the Pi SDK. Child `bash` is stock Pi bash (no owned jobs or sandbox modes inside children), presets are pi-dsh config objects rather than full Pi profiles, and `interrupt_agent` waits for the turn to settle instead of returning on acceptance. Children share the workspace with no worktree isolation — the board's write-scope warnings are advisory, as in DSH.
 - `pwsh` tools register only when a pwsh binary exists.
 
 ## Development
