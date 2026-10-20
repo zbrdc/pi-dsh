@@ -1,6 +1,42 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import factory from "../src/index.ts";
+
+function makeHarness(mode: string, hasUI: boolean) {
+  const handlers = new Map<string, any[]>();
+  const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const entries: Array<[string, unknown]> = [];
+  const userMessages: Array<{ content: any; options: any }> = [];
+  const widgets = new Map<string, any>();
+  const statuses = new Map<string, any>();
+  const pi: any = {
+    on(event: string, handler: any) { const l = handlers.get(event) ?? []; l.push(handler); handlers.set(event, l); },
+    registerTool(def: any) { tools.set(def.name, def); },
+    registerCommand(name: string, def: any) { commands.set(name, def); },
+    appendEntry(customType: string, data: unknown) { entries.push([customType, data]); },
+    sendMessage() { /* recorded elsewhere when relevant */ },
+    sendUserMessage(content: any, options: any) { userMessages.push({ content, options }); },
+  };
+  factory(pi);
+  const ctx: any = {
+    cwd: "/tmp", hasUI, mode,
+    ui: {
+      notify() { if (!hasUI) throw new Error("notify called without UI"); },
+      setWidget(key: string, content: any) { widgets.set(key, content); },
+      setStatus(key: string, text: any) { statuses.set(key, text); },
+    },
+    sessionManager: { getSessionId: () => `harness-${mode}`, getBranch: () => [], getSessionFile: () => undefined },
+    isIdle: () => true, hasPendingMessages: () => false,
+  };
+  const emit = async (event: string, payload: any) => {
+    let result;
+    for (const h of handlers.get(event) ?? []) result = await h(payload, ctx);
+    return result;
+  };
+  return { tools, commands, entries, userMessages, widgets, statuses, ctx, emit };
+}
 
 test("before_agent_start publishes control section and context refreshes changed state", async () => {
   const handlers = new Map<string, any[]>();
@@ -56,4 +92,58 @@ test("before_agent_start publishes control section and context refreshes changed
   await emit("session_compact", { type: "session_compact" });
   const afterCompaction = await emit("context", { type: "context", messages: [{ role: "user", content: "continue after compaction", timestamp: 2 }] });
   assert.equal(afterCompaction.messages.at(-1).customType, "pi-dsh/control");
+});
+
+test("widgets + status refresh across todo, goal, and background job", async () => {
+  const h = makeHarness("tui", true);
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  await h.emit("input", { type: "input", text: "work", source: "interactive" });
+  await h.tools.get("create_goal").execute("1", { objective: "Widget goal" }, undefined, undefined, h.ctx);
+  await h.tools.get("todo_write").execute("2", { todos: [{ content: "Widget todo", status: "in_progress" }] }, undefined, undefined, h.ctx);
+  assert.match(h.widgets.get("pi-dsh-goal").join("\n"), /Widget goal/);
+  assert.match(h.widgets.get("pi-dsh-todo").join("\n"), /Widget todo/);
+  assert.match(h.statuses.get("pi-dsh"), /goal active/);
+  const started = await h.tools.get("bash").execute("3", { command: "sleep 30", run_in_background: true }, undefined, undefined, h.ctx);
+  assert.match(started.content[0].text, /background job/);
+  assert.match(h.widgets.get("pi-dsh-jobs").join("\n"), /Jobs \(1 running\)/);
+  const jobId = started.content[0].text.match(/job (\S+)/)[1];
+  await h.tools.get("job_kill").execute("4", { job_id: jobId }, undefined, undefined, h.ctx);
+  assert.match(h.widgets.get("pi-dsh-jobs").join("\n"), /Jobs \(0 running\)/);
+  await h.emit("session_shutdown", { type: "session_shutdown" });
+});
+
+test("/plan <task> in print mode: no UI calls, task delivered at before_agent_start", async () => {
+  const h = makeHarness("print", false);
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  await h.commands.get("plan").handler("Design the drift ledger", h.ctx);
+  assert.ok(h.entries.some(([name, data]: any) => name === "pi-dsh/plan" && data?.prompt === "Design the drift ledger"));
+  assert.equal(h.userMessages.at(-1)?.options?.deliverAs, "followUp");
+  const startEvent: any = { type: "before_agent_start", messageType: "user", prompt: "hi", systemPrompt: "", systemPromptOptions: { sections: {} } };
+  const result = await h.emit("before_agent_start", startEvent);
+  assert.match(result.message.content, /Plan task \(from \/plan\): Design the drift ledger/);
+  // Delivered once: a second turn does not repeat the queued task.
+  const again = await h.emit("before_agent_start", { ...startEvent, systemPromptOptions: { sections: {} } });
+  assert.doesNotMatch(again.message.content, /Plan task/);
+  // Headless exit_plan_mode auto-approves (no dialog surface exists).
+  const exit = await h.tools.get("exit_plan_mode").execute("9", { plan: "# Plan" }, undefined, undefined, h.ctx);
+  assert.match(exit.content[0].text, /Plan approved/);
+});
+
+test("tool_call caps timeout-shaped inputs on foreign tools", async () => {
+  const h = makeHarness("tui", true);
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  const event: any = { type: "tool_call", toolCallId: "c1", toolName: "web_fetch", input: { url: "x", timeout_ms: 9_999_999 } };
+  await h.emit("tool_call", event);
+  assert.equal(event.input.timeout_ms, 600_000);
+});
+
+test("dsh-compat manifest matches registered tools and commands", async () => {
+  const h = makeHarness("tui", true);
+  const manifest = JSON.parse(readFileSync(new URL("../dsh-compat.json", import.meta.url), "utf8"));
+  assert.match(manifest.dsh.commit, /^[0-9a-f]{40}$/);
+  for (const area of manifest.areas) {
+    if (area.status === "not-ported" || area.status === "not-applicable") continue;
+    for (const tool of area.piTools ?? []) assert.ok(h.tools.has(tool), `${area.area}: tool ${tool} registered`);
+    for (const cmd of area.piCommands ?? []) assert.ok(h.commands.has(cmd), `${area.area}: command /${cmd} registered`);
+  }
 });

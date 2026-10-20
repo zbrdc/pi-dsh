@@ -10,12 +10,14 @@ import { Type } from "typebox";
 import {
   RepeatTracker, spillText, pruneText, validateTodos, generateSdk,
   newGoal, applyBlocker, renderGoalRound, renderTaskControlSection, Semaphore, completedTurnCut,
+  resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog,
   SANDBOX_ORDER, type TodoItem, type Goal, type SandboxMode,
 } from "./core.ts";
 import { JobRegistry } from "./jobs.ts";
 import { TerminalRegistry, PersistentBash, runShellJob } from "./terminal.ts";
 import { NodePtcProvider, MossbedProvider, PythonPtcProvider, type PtcBindings } from "./ptc.ts";
 import { SubagentManager, type CatalogEntry } from "./subagent.ts";
+import { renderAgentsWidget, renderDashboard, renderGoalWidget, renderJobsWidget, renderStatusLine, renderTodoWidget, type UiState } from "./ui.ts";
 
 const ENTRY = { todo: "pi-dsh/todo", plan: "pi-dsh/plan", goal: "pi-dsh/goal", catalog: "pi-dsh/catalog", team: "pi-dsh/team-tasks" };
 const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
@@ -26,12 +28,18 @@ interface Config {
   ptcOnly: boolean; persistentPtc: boolean; maxActiveSubagents: number; goalBlockedThreshold: number;
   sandboxMode: SandboxMode; maxParallelSubCalls: number;
   completionDelivery: "wakeup" | "quiet"; maxConsecutiveWakes?: number;
+  uiWidgets: boolean;
+  toolTimeoutMs?: Record<string, number>; defaultToolTimeoutMs?: number;
+  toolTimeoutAction: "abort" | "notify";
+  durableTerminals: boolean;
+  sandboxRunnerCommand?: string[];
 }
 function loadConfig(): Config {
   const defaults: Config = {
     allowParallelInProgress: true, spillMaxInlineTokens: 12500, pruneThresholdChars: 400_000,
     ptcOnly: false, persistentPtc: false, maxActiveSubagents: 8, goalBlockedThreshold: 3,
     sandboxMode: "danger-full-access", maxParallelSubCalls: 10, completionDelivery: "wakeup",
+    uiWidgets: true, toolTimeoutAction: "abort", durableTerminals: false,
   };
   try {
     const path = join(homedir(), ".pi", "agent", "pi-dsh.json");
@@ -48,7 +56,9 @@ export default function (pi: any) {
   const pythonPtc = new PythonPtcProvider();
   const mossbed = new MossbedProvider();
   jobs.setPersistRoot(join(homedir(), ".pi", "agent", "pi-dsh", "jobs"));
+  terminals.setPersistRoot(join(homedir(), ".pi", "agent", "pi-dsh", "terminals"));
   const subagents = new SubagentManager({ maxActive: config.maxActiveSubagents });
+  const watchdog = new ToolWatchdog();
 
   let lastCtx: any;
   let owner = "unknown";
@@ -58,6 +68,7 @@ export default function (pi: any) {
   let humanTurn = false;
   let wakeCount = 0;
   let pendingGoalRound: number | undefined;
+  let pendingPlanPrompt: string | undefined;
   let lastControlSection = "";
   interface TeamTask { id: string; subject: string; description: string; status: string; owner?: string }
   let teamTasks: TeamTask[] = [];
@@ -78,10 +89,30 @@ export default function (pi: any) {
       else pi.sendMessage({ customType, content, display: true }, { deliverAs: "steer" });
     } catch { /* disposed session: notice is best-effort, state is durable */ }
   };
-  const updateGoalWidget = () => {
+  const uiState = (): UiState => ({
+    goal, todos, planActive,
+    jobs: jobs.list(owner), agents: subagents.list(owner), terminals: terminals.list(owner), teamTasks,
+  });
+  /** One refresh for every widget + status (DSH ui-goal/ui-jobs/ui-subagent, Pi-shaped). */
+  const refreshUI = () => {
+    if (!config.uiWidgets) return;
     try {
-      if (lastCtx?.hasUI) lastCtx.ui.setWidget("pi-dsh-goal", goal ? [`${goal.status === "complete" ? "✔" : goal.status === "blocked" ? "⛔" : "◎"} Goal (${goal.status}, round ${goal.roundsStarted}/${goal.maxGoalRounds}): ${goal.objective.slice(0, 90)}`] : undefined);
+      if (!lastCtx?.hasUI) return;
+      const state = uiState();
+      lastCtx.ui.setStatus("pi-dsh", renderStatusLine(state));
+      lastCtx.ui.setWidget("pi-dsh-goal", renderGoalWidget(goal));
+      lastCtx.ui.setWidget("pi-dsh-todo", renderTodoWidget(todos));
+      lastCtx.ui.setWidget("pi-dsh-jobs", renderJobsWidget(state.jobs));
+      lastCtx.ui.setWidget("pi-dsh-agents", renderAgentsWidget(state));
     } catch { /* UI gone */ }
+  };
+  const updateGoalWidget = refreshUI;
+  /** Command feedback that works headless: TUI notify, else a displayed session message. */
+  const safeNotify = (ctx: any, message: string, type: "info" | "warning" | "error" = "info") => {
+    try {
+      if (ctx?.hasUI) ctx.ui.notify(message, type);
+      else pi.sendMessage({ customType: "pi-dsh/notice", content: message, display: true }, { deliverAs: "nextTurn" });
+    } catch { /* disposed session */ }
   };
   /** Resolve a sandbox request against the standing mode; widening needs justification + approval. */
   const resolveSandbox = async (ctx: any, requested?: string, justification?: string): Promise<{ mode: SandboxMode } | { error: string }> => {
@@ -110,12 +141,12 @@ export default function (pi: any) {
 
   function restore(ctx: any) {
     remember(ctx);
-    todos = []; planActive = false; goal = undefined; teamTasks = []; pendingGoalRound = undefined; observed.clear(); absent.clear();
+    todos = []; planActive = false; goal = undefined; teamTasks = []; pendingGoalRound = undefined; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
     const catalog: CatalogEntry[] = [];
     for (const e of ctx.sessionManager.getBranch()) {
       if (e.type !== "custom") continue;
       if (e.customType === ENTRY.todo) todos = (e.data as TodoItem[]) ?? [];
-      if (e.customType === ENTRY.plan) planActive = Boolean((e.data as any)?.active);
+      if (e.customType === ENTRY.plan) { planActive = Boolean((e.data as any)?.active); if (typeof (e.data as any)?.prompt === "string" && planActive) pendingPlanPrompt = (e.data as any).prompt; }
       if (e.customType === ENTRY.goal) goal = e.data as Goal;
       if (e.customType === ENTRY.team) { teamTasks = (e.data as TeamTask[]) ?? []; teamSeq = teamTasks.length; }
       if (e.customType === ENTRY.catalog) {
@@ -126,11 +157,8 @@ export default function (pi: any) {
     }
     subagents.restore(catalog);
     jobs.restore(owner);
-    updateGoalWidget();
-    if (ctx.hasUI) {
-      ctx.ui.setStatus("pi-dsh", `dsh${goal && goal.status === "active" ? ` · goal r${goal.roundsStarted}` : ""}${planActive ? " · plan" : ""}`);
-      ctx.ui.setWidget("pi-dsh-todo", todos.length ? todos.map((t) => `${t.status === "completed" ? "✔" : t.status === "in_progress" ? "▶" : "○"} ${t.content}`) : undefined);
-    }
+    terminals.restore(owner);
+    refreshUI();
   }
 
   pi.on("session_start", async (_e: any, ctx: any) => restore(ctx));
@@ -144,7 +172,7 @@ export default function (pi: any) {
   });
   pi.on("session_shutdown", async () => {
     await jobs.disposeOwner(owner, { keepDurable: true }).catch(() => undefined);
-    await terminals.disposeOwner(owner).catch(() => undefined);
+    await terminals.disposeOwner(owner, { keepDurable: true }).catch(() => undefined);
     await subagents.disposeOwner(owner).catch(() => undefined);
     nodePtc.disposeAll();
   });
@@ -166,18 +194,42 @@ export default function (pi: any) {
     e.systemPromptOptions.sections["pi_dsh"] = control;
     lastControlSection = control;
     if (!planActive) return undefined;
+    // Deliver a /plan <task> queued headlessly (print mode may never run the
+    // follow-up user message; whichever turn happens first carries the task).
+    const queued = pendingPlanPrompt;
+    pendingPlanPrompt = undefined;
     return { message: {
       customType: "pi-dsh/plan", display: false,
-      content: "Plan mode is active. Explore and design before executing. Do not make changes yet. When the plan is complete, call exit_plan_mode with the full plan as markdown for user review.",
+      content: `Plan mode is active. Explore and design before executing. Do not make changes yet. When the plan is complete, call exit_plan_mode with the full plan as markdown for user review.${queued ? `\n\nPlan task (from /plan): ${queued}` : ""}`,
     } };
   });
+
+  // ---- Tool deadlines (dsh timeout-policy, Pi-shaped) ----
+  // DSH wraps dispatch and swaps in a deadline signal per call. A Pi extension
+  // cannot swap the signal of a model-issued foreign call, so enforcement is:
+  // cap timeout-shaped inputs at tool_call, fuse real deadline signals into
+  // nested executeTool calls (PTC), and run a watchdog over top-level calls
+  // whose configured deadline aborts the turn and stamps TOOL_TIMEOUT on the
+  // result. Tools with no configured limit are untouched, as in DSH.
+  pi.on("tool_execution_start", async (e: any, ctx: any) => {
+    remember(ctx);
+    if (e.parentToolCallId) return; // nested calls carry their own fused signal
+    const timeoutMs = resolveToolTimeoutMs(e.toolName, config);
+    if (timeoutMs === undefined) return;
+    watchdog.arm(e.toolCallId, e.toolName, timeoutMs, (toolName, ms) => {
+      notify(`[pi-dsh] TOOL_TIMEOUT: ${toolName} exceeded its ${ms}ms deadline${config.toolTimeoutAction === "abort" ? "; aborting the turn" : ""}.`, "pi-dsh/tool-timeout");
+      if (config.toolTimeoutAction === "abort") { try { lastCtx?.abort?.(); } catch { /* already settled */ } }
+    });
+  });
+  pi.on("tool_execution_end", async (e: any) => { watchdog.clear(e.toolCallId, true); refreshUI(); });
 
   // ---- Guards, FS policy (tool_call) ----
   pi.on("tool_call", async (e: any, ctx: any) => {
     remember(ctx);
     const reminder = repeat.observe(e.toolName, e.input);
     if (reminder) notify(reminder, "pi-dsh/repeat-reminder");
-    if (e.toolName === "bash" && typeof e.input?.timeout === "number" && e.input.timeout > 600) e.input.timeout = 600;
+    const capMs = Math.min(resolveToolTimeoutMs(e.toolName, config) ?? 600_000, 600_000);
+    for (const { field, capped } of timeoutFieldCaps(e.input, capMs)) e.input[field] = capped;
     if ((e.toolName === "edit" || e.toolName === "write") && typeof e.input?.path === "string") {
       const path = resolvePath(ctx, e.input.path);
       let exists = true;
@@ -197,6 +249,7 @@ export default function (pi: any) {
   // ---- Spill + observation recording (tool_result) ----
   pi.on("tool_result", async (e: any, ctx: any) => {
     remember(ctx);
+    const timedOut = watchdog.settle(e.toolCallId);
     if (e.toolName === "read" && typeof e.input?.path === "string") {
       const path = resolvePath(ctx, e.input.path);
       const h = await hashFile(path).catch(() => undefined);
@@ -207,6 +260,13 @@ export default function (pi: any) {
       const path = resolvePath(ctx, e.input.path);
       const h = await hashFile(path).catch(() => undefined);
       if (h !== undefined) { observed.set(path, h); absent.delete(path); }
+    }
+    if (timedOut) {
+      const body = (e.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+      return {
+        content: [{ type: "text", text: `Error: tool call timed out after ${timedOut.timeoutMs}ms (TOOL_TIMEOUT)${body ? `\nPartial result before the deadline:\n${body.slice(0, 4000)}` : ""}` }],
+        structuredContent: e.structuredContent, details: { ...(e.details ?? {}), piDshTimeout: timedOut }, isError: true,
+      };
     }
     const imageBlocks = (e.content ?? []).filter((c: any) => c.type === "image");
     if (imageBlocks.length > 0 && !e.isError) {
@@ -310,7 +370,7 @@ export default function (pi: any) {
       try { todos = validateTodos(params.todos, config.allowParallelInProgress); }
       catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
       pi.appendEntry(ENTRY.todo, todos);
-      if (ctx.hasUI) ctx.ui.setWidget("pi-dsh-todo", todos.map((t) => `${t.status === "completed" ? "✔" : t.status === "in_progress" ? "▶" : "○"} ${t.content}`));
+      refreshUI();
       const n = (s: string) => todos.filter((t) => t.status === s).length;
       return text(`Updated todo list: ${n("pending")} pending, ${n("in_progress")} in progress, ${n("completed")} completed.`);
     },
@@ -318,15 +378,28 @@ export default function (pi: any) {
 
   // ---- Plan mode ----
   pi.registerCommand("plan", {
-    description: "Enter or leave plan mode (/plan, /plan off)",
+    description: "Enter or leave plan mode (/plan [task], /plan off)",
     handler: async (args: string, ctx: any) => {
       remember(ctx);
-      if (args.trim() === "off") { planActive = false; pi.appendEntry(ENTRY.plan, { active: false }); ctx.ui.notify("Plan mode off"); return; }
-      planActive = true; pi.appendEntry(ENTRY.plan, { active: true });
-      ctx.ui.notify("Plan mode on");
+      const task = args.trim();
+      if (task === "off") {
+        planActive = false; pendingPlanPrompt = undefined;
+        pi.appendEntry(ENTRY.plan, { active: false });
+        refreshUI(); safeNotify(ctx, "Plan mode off"); return;
+      }
+      planActive = true;
+      // Persist the task with the plan state so print/json mode (where a
+      // follow-up user message may never be dispatched) still delivers it:
+      // before_agent_start injects it into the next turn that does run.
+      pendingPlanPrompt = task || undefined;
+      pi.appendEntry(ENTRY.plan, { active: true, ...(task ? { prompt: task } : {}) });
+      refreshUI(); safeNotify(ctx, "Plan mode on");
       // A custom message entry (not only a custom entry) so a fresh session persists its file.
       pi.sendMessage({ customType: "pi-dsh/plan", content: "Plan mode is active: explore and design, then present the plan with exit_plan_mode.", display: true });
-      if (args.trim()) pi.sendUserMessage(args.trim());
+      if (task) {
+        if (ctx.hasUI) pi.sendUserMessage(task);
+        else pi.sendUserMessage(task, { deliverAs: "followUp" });
+      }
     },
   });
   pi.registerTool({
@@ -344,7 +417,7 @@ export default function (pi: any) {
         if (!approved) feedback = (await ctx.ui.input("Feedback for the plan", "What should change?")) ?? "";
       }
       if (!approved) return text(`User kept plan mode active. Feedback: ${feedback || "(none)"}. Revise the plan and call exit_plan_mode again.`);
-      planActive = false; pi.appendEntry(ENTRY.plan, { active: false });
+      planActive = false; pendingPlanPrompt = undefined; pi.appendEntry(ENTRY.plan, { active: false }); refreshUI();
       return text("Plan approved. Plan mode is now inactive; carry out the plan from the next step.");
     },
   });
@@ -377,6 +450,7 @@ export default function (pi: any) {
 
   // ---- Jobs + bash ----
   jobs.onSettle = (snap, info) => {
+    refreshUI();
     if (info.owner !== owner || info.awaited || info.killRequested) return;
     notify(`background job ${snap.id} (${snap.kind}: ${snap.label}) finished [status: ${snap.status}]. Read its output with job_output.`, "pi-dsh/job-complete");
   };
@@ -414,7 +488,7 @@ export default function (pi: any) {
     const stamp = `bash-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const outFile = join(dir, `${stamp}.out`); const exitFile = join(dir, `${stamp}.exit`);
     try { mkdirSync(dir, { recursive: true }); } catch { /* shell will report */ }
-    return jobs.start({
+    const startedId = jobs.start({
       kind: "bash", label: description || command.slice(0, 60), owner, durable: { outFile, exitFile },
       run: async (h) => {
         let offset = 0;
@@ -425,7 +499,7 @@ export default function (pi: any) {
           } catch { /* not created yet */ }
         }, 250);
         try {
-          await runShellJob({ command, cwd, signal: h.signal, append: (t) => h.append(t), sandboxMode, shell, outFile, exitFile });
+          await runShellJob({ command, cwd, signal: h.signal, append: (t) => h.append(t), sandboxMode, shell, outFile, exitFile, sandboxRunner: config.sandboxRunnerCommand });
         } finally { clearInterval(poll); }
         try { const body = readFileSync(outFile, "utf8"); if (body.length > offset) h.append(body.slice(offset)); } catch { /* gone */ }
         let code = "0";
@@ -434,6 +508,8 @@ export default function (pi: any) {
         return {};
       },
     });
+    refreshUI();
+    return startedId;
   };
   pi.registerTool({
     name: "bash", label: "Bash (pi-dsh)",
@@ -475,12 +551,15 @@ export default function (pi: any) {
   // ---- Terminal tools ----
   const termParams = (extra: Record<string, unknown> = {}) => Type.Object({ terminal_id: Type.String(), ...extra });
   pi.registerTool({
-    name: "terminal_open", label: "Terminal open", description: "Open a persistent PTY terminal session owned by this agent.",
-    parameters: Type.Object({ label: Type.Optional(Type.String()) }),
+    name: "terminal_open", label: "Terminal open", description: "Open a persistent PTY terminal session owned by this agent. durable=true runs it in a detached tmux session that survives a pi exit and reattaches on restore (requires tmux); non-durable terminals keep a transcript but their shell dies with pi.",
+    parameters: Type.Object({ label: Type.Optional(Type.String()), durable: Type.Optional(Type.Boolean()) }),
     async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      const s = await terminals.open(owner, { cwd: ctx.cwd, label: p.label });
-      return text(`opened terminal ${s.id}`);
+      try {
+        const s = await terminals.open(owner, { cwd: ctx.cwd, label: p.label, durable: p.durable ?? config.durableTerminals });
+        refreshUI();
+        return text(`opened terminal ${s.id} [${s.backend}${s.durable ? ", durable" : ""}]`);
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     },
   });
   pi.registerTool({
@@ -515,7 +594,7 @@ export default function (pi: any) {
     parameters: Type.Object({}),
     async execute(_id: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      const rows = terminals.list(owner).map((t) => `${t.id} ${t.alive ? "alive" : "exited"} — ${t.label}`);
+      const rows = terminals.list(owner).map((t) => `${t.id} [${t.backend}${t.durable ? ",durable" : ""}] ${t.alive ? "alive" : "exited"} — ${t.label} (${t.cwd})`);
       return text(rows.length ? rows.join("\n") : "No terminals.");
     },
   });
@@ -524,7 +603,7 @@ export default function (pi: any) {
     parameters: termParams(),
     async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
-      try { await terminals.close(owner, p.terminal_id); return text(`closed terminal ${p.terminal_id}`); }
+      try { await terminals.close(owner, p.terminal_id); refreshUI(); return text(`closed terminal ${p.terminal_id}`); }
       catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     },
   });
@@ -577,8 +656,9 @@ export default function (pi: any) {
   }
 
   // ---- Subagents ----
-  subagents.onCatalog = (entry) => { try { pi.appendEntry(ENTRY.catalog, entry); } catch { /* session gone */ } };
+  subagents.onCatalog = (entry) => { refreshUI(); try { pi.appendEntry(ENTRY.catalog, entry); } catch { /* session gone */ } };
   subagents.onSettle = (entry, result, delivery) => {
+    refreshUI();
     if (entry.owner !== owner || delivery !== "parent") return;
     notify(`subagent ${entry.childId} (${entry.provider}: ${entry.label}) finished [status: ${result.status}]. Final answer:\n${result.text.slice(0, 8000)}`, "pi-dsh/subagent-complete");
   };
@@ -638,7 +718,7 @@ export default function (pi: any) {
   });
 
   // ---- Agent teams (experimental tool-agent-team shape) ----
-  const persistTeam = () => { try { pi.appendEntry(ENTRY.team, teamTasks); } catch { /* gone */ } };
+  const persistTeam = () => { refreshUI(); try { pi.appendEntry(ENTRY.team, teamTasks); } catch { /* gone */ } };
   pi.registerTool({
     name: "spawn_teammate", label: "Spawn teammate", exposure: "model-only",
     description: "Spawn a continuable teammate subagent on this session's team. Returns its id; results arrive as completion notices, or via wait_agent.",
@@ -804,12 +884,52 @@ export default function (pi: any) {
     handler: async (args: string, ctx: any) => {
       remember(ctx);
       const a = args.trim();
-      if (!a || a === "status") { ctx.ui.notify(goal ? `${goal.status} r${goal.roundsStarted}/${goal.maxGoalRounds}: ${goal.objective}` : "No goal"); return; }
-      if (a === "clear") { goal = undefined; pi.appendEntry(ENTRY.goal, undefined); ctx.ui.notify("Goal cleared"); return; }
+      if (!a || a === "status") { safeNotify(ctx, goal ? `${goal.status} r${goal.roundsStarted}/${goal.maxGoalRounds}: ${goal.objective}` : "No goal"); return; }
+      if (a === "clear") { goal = undefined; pi.appendEntry(ENTRY.goal, undefined); refreshUI(); safeNotify(ctx, "Goal cleared"); return; }
       if (a === "pause" && goal) { goal.status = "paused"; goal.armed = false; goal.revision++; }
       else if (a === "resume" && goal) { goal.status = "active"; goal.armed = true; goal.revision++; }
       else if (a !== "pause" && a !== "resume") goal = newGoal(`goal-${Date.now()}`, expandAttachments(a, ctx.cwd));
-      persistGoal(); ctx.ui.notify(`Goal: ${goal?.status} — ${goal?.objective}`);
+      persistGoal(); safeNotify(ctx, `Goal: ${goal?.status} — ${goal?.objective}`);
+    },
+  });
+  // ---- Dashboard commands (user-facing views over widget state) ----
+  pi.registerCommand("dsh", {
+    description: "Show the pi-dsh dashboard (goal, todos, jobs, agents, terminals)",
+    handler: async (_args: string, ctx: any) => { remember(ctx); refreshUI(); safeNotify(ctx, renderDashboard(uiState())); },
+  });
+  pi.registerCommand("todos", {
+    description: "Show the current todo list",
+    handler: async (_args: string, ctx: any) => { remember(ctx); safeNotify(ctx, renderTodoWidget(todos, 40)?.join("\n") ?? "No todos."); },
+  });
+  pi.registerCommand("jobs", {
+    description: "Show background jobs (or /jobs kill <id>)",
+    handler: async (args: string, ctx: any) => {
+      remember(ctx);
+      const killId = args.trim().match(/^kill\s+(\S+)$/)?.[1];
+      if (killId) {
+        try { const r = await jobs.kill(killId, owner); refreshUI(); safeNotify(ctx, `${r.outcome}: ${killId} [${r.job.status}]`); }
+        catch (e) { safeNotify(ctx, `Error: ${e instanceof Error ? e.message : String(e)}`, "error"); }
+        return;
+      }
+      safeNotify(ctx, renderJobsWidget(jobs.list(owner), 30)?.join("\n") ?? "No background jobs.");
+    },
+  });
+  pi.registerCommand("agents", {
+    description: "Show subagents and team tasks",
+    handler: async (_args: string, ctx: any) => { remember(ctx); safeNotify(ctx, renderAgentsWidget(uiState(), 40)?.join("\n") ?? "No subagents, terminals, or team tasks."); },
+  });
+  pi.registerCommand("terminals", {
+    description: "Show PTY terminals (or /terminals close <id>)",
+    handler: async (args: string, ctx: any) => {
+      remember(ctx);
+      const closeId = args.trim().match(/^close\s+(\S+)$/)?.[1];
+      if (closeId) {
+        try { await terminals.close(owner, closeId); refreshUI(); safeNotify(ctx, `closed terminal ${closeId}`); }
+        catch (e) { safeNotify(ctx, `Error: ${e instanceof Error ? e.message : String(e)}`, "error"); }
+        return;
+      }
+      const rows = terminals.list(owner).map((t) => `${t.id} [${t.backend}${t.durable ? ",durable" : ""}] ${t.alive ? "alive" : "exited"} — ${t.label} (${t.cwd})`);
+      safeNotify(ctx, rows.length ? rows.join("\n") : "No terminals.");
     },
   });
   // Goal round driver: continue at quiescence while armed, allowance remains, no live descendants.
@@ -835,7 +955,8 @@ export default function (pi: any) {
     for (const t of (ctx.tools ?? [])) {
       if (t.name === "run_code" || t.name === "codemode") continue;
       tools[t.name] = (args: any) => scheduler.run(async () => {
-        const outcome = await ctx.executeTool(t.name, args ?? {}, { signal });
+        // Nested calls get a real fused deadline signal (per-tool config).
+        const outcome = await ctx.executeTool(t.name, args ?? {}, { signal: fuseSignal(signal, resolveToolTimeoutMs(t.name, config)) });
         // Surface image results after the outer run_code result (dsh PTC behaviour).
         const images = (outcome.result?.content ?? []).filter((c: any) => c.type === "image");
         if (capturedImages && images.length > 0 && !outcome.isError) capturedImages.push(...images);
@@ -887,6 +1008,7 @@ export default function (pi: any) {
       else rendered = renderPtc("run_code", await nodePtc.run({
         program: await stripTypes(p.code), bindings, cwd: ctx.cwd,
         timeoutMs: p.timeout_ms, signal, stateOwner: config.persistentPtc ? owner : undefined, sandboxMode: sb.mode,
+        sandboxRunner: config.sandboxRunnerCommand,
       }));
       if (capturedImages.length > 0) {
         rendered = { ...rendered, content: [...(rendered.content ?? []), ...capturedImages.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))] };

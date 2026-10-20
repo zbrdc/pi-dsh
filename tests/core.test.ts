@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs } from "../src/core.ts";
+import { validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs, resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, tmuxSessionName, tmuxSendKeysChunks } from "../src/core.ts";
 import { JobRegistry } from "../src/jobs.ts";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { capLines, renderAgentsWidget, renderDashboard, renderJobsWidget, renderStatusLine, renderTodoWidget } from "../src/ui.ts";
+import { TerminalRegistry, tmuxAvailable } from "../src/terminal.ts";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { NodePtcProvider, MossbedProvider } from "../src/ptc.ts";
@@ -206,4 +208,109 @@ test("child prompt and schema-led structured parameters are explicit", () => {
   assert.ok(prompt.includes("Do not finish with a plain text answer"));
   const audit = { type: "object", properties: { verdict: { type: "string", enum: ["accept", "reject"] }, gaps: { type: "string" } }, required: ["verdict", "gaps"] };
   assert.deepEqual(structuredToolParameters(audit), audit);
+});
+
+test("tool timeout resolution, input caps, fused signal, watchdog", async () => {
+  assert.equal(resolveToolTimeoutMs("web_fetch", { toolTimeoutMs: { web_fetch: 30_000 } }), 30_000);
+  assert.equal(resolveToolTimeoutMs("read", { toolTimeoutMs: { web_fetch: 30_000 } }), undefined);
+  assert.equal(resolveToolTimeoutMs("read", { defaultToolTimeoutMs: 5_000 }), 5_000);
+  assert.equal(resolveToolTimeoutMs("read", { defaultToolTimeoutMs: 0 }), undefined);
+  assert.deepEqual(timeoutFieldCaps({ timeout: 9999, timeout_ms: 999_999, keep: 1 }), [
+    { field: "timeout", capped: 600 }, { field: "timeout_ms", capped: 600_000 },
+  ]);
+  assert.deepEqual(timeoutFieldCaps({ timeout: 10 }), []);
+  const fused = fuseSignal(undefined, 5) as AbortSignal;
+  assert.equal(fused.aborted, false);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fused.aborted, true);
+  const wd = new ToolWatchdog();
+  let fired: string | undefined;
+  wd.arm("call-1", "web_fetch", 5, (name) => { fired = name; });
+  wd.arm("call-2", "read", 60_000, () => undefined);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fired, "web_fetch");
+  assert.deepEqual(wd.settle("call-1"), { toolName: "web_fetch", timeoutMs: 5 });
+  assert.equal(wd.settle("call-2"), undefined);
+  assert.equal(wd.active, 0);
+});
+
+test("tmux naming and send-keys chunks", () => {
+  assert.equal(tmuxSessionName("owner/with:chars", 3), "pidsh-owner_with_chars-3");
+  assert.deepEqual(tmuxSendKeysChunks("echo hi\n"), [{ literal: "echo hi" }, { enter: true }]);
+  assert.deepEqual(tmuxSendKeysChunks("echo hi\r"), [{ literal: "echo hi" }, { enter: true }]);
+  assert.deepEqual(tmuxSendKeysChunks("a\nb"), [{ literal: "a" }, { enter: true }, { literal: "b" }]);
+  assert.deepEqual(tmuxSendKeysChunks("no-newline"), [{ literal: "no-newline" }]);
+});
+
+test("ui widgets render bounded goal/todo/jobs/agents state", () => {
+  const now = Date.now();
+  const state = {
+    goal: newGoal("g1", "Ship it", 10), planActive: true,
+    todos: [
+      { content: "done thing", status: "completed" as const },
+      { content: "live thing", status: "in_progress" as const },
+    ],
+    jobs: [{ id: "bash-1", kind: "bash", label: "sleep", status: "running" as const, startedAt: now - 5000 }],
+    agents: [{ childId: "c1", provider: "spawn", label: "audit", owner: "o", cwd: "/tmp", createdAt: now, status: "live" as const }],
+    terminals: [{ id: "term-1", label: "bash", alive: true, backend: "tmux" }],
+    teamTasks: [{ id: "task-1", subject: "Review", status: "pending" }],
+  };
+  assert.match(renderStatusLine(state), /plan/);
+  assert.match(renderStatusLine(state), /1 job/);
+  assert.match(renderTodoWidget(state.todos)!.join("\n"), /Todos 1\/2/);
+  assert.match(renderJobsWidget(state.jobs, 6, now)!.join("\n"), /bash-1/);
+  const agents = renderAgentsWidget(state)!.join("\n");
+  assert.match(agents, /c1/); assert.match(agents, /term-1/); assert.match(agents, /task-1/);
+  assert.match(renderDashboard(state, now), /Plan mode: ACTIVE/);
+  assert.deepEqual(capLines(["a", "b", "c", "d"], 3), ["a", "b", "… +2 more"]);
+  assert.equal(renderTodoWidget([]), undefined);
+  assert.equal(renderJobsWidget([]), undefined);
+});
+
+test("terminal restore: dead session becomes readable exited stub", () => {
+  const root = mkdtempSync(join(tmpdir(), "pidsh-term-"));
+  const dir = join(root, "owner1");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "term-7.json"), JSON.stringify({ id: "term-7", owner: "owner1", label: "bash", backend: "node-pty", cwd: "/tmp", shell: "bash", durable: false, createdAt: 1 }), "utf8");
+  writeFileSync(join(dir, "term-7.log"), "hello from before\n", "utf8");
+  const reg = new TerminalRegistry();
+  reg.setPersistRoot(root);
+  reg.restore("owner1");
+  const rows = reg.list("owner1");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.alive, false);
+  const out = reg.get("owner1", "term-7").ring.readNew();
+  assert.match(out, /hello from before/);
+  assert.match(out, /transcript preserved/);
+  assert.throws(() => reg.send("owner1", "term-7", "x"), /exited/);
+});
+
+test("durable tmux terminal survives dispose and reattaches on restore", async () => {
+  if (!tmuxAvailable()) return; // backend unavailable on this host
+  const root = mkdtempSync(join(tmpdir(), "pidsh-tmux-"));
+  const owner = `test-${Date.now()}`;
+  const reg = new TerminalRegistry();
+  reg.setPersistRoot(root);
+  const s = await reg.open(owner, { cwd: "/tmp", durable: true });
+  try {
+    assert.equal(s.backend, "tmux");
+    reg.send(owner, s.id, "echo PIDSH_TMUX_OK");
+    let seen = "";
+    for (let i = 0; i < 40 && !seen.includes("PIDSH_TMUX_OK"); i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      seen += s.ring.readNew();
+    }
+    assert.match(seen, /PIDSH_TMUX_OK/);
+    await reg.disposeOwner(owner, { keepDurable: true });
+    const reg2 = new TerminalRegistry();
+    reg2.setPersistRoot(root);
+    reg2.restore(owner);
+    const back = reg2.get(owner, s.id);
+    assert.equal(back.alive, true);
+    assert.match(back.ring.readNew(), /reattached after restart/);
+    await reg2.close(owner, s.id);
+    assert.equal(reg2.list(owner).length, 0);
+  } finally {
+    await reg.disposeOwner(owner).catch(() => undefined);
+  }
 });

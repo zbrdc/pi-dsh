@@ -1,3 +1,7 @@
 {
-  "sandboxMode": "workspace-write"
+  "sandboxMode": "workspace-write",
+  "uiWidgets": true,
+  "durableTerminals": false,
+  "toolTimeoutMs": { "web_fetch": 30000, "web_search": 30000 },
+  "toolTimeoutAction": "abort"
 }

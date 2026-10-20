@@ -289,6 +289,99 @@ export function completedTurnCut(messages: any[]): number {
   return cut;
 }
 
+/** Cooperative per-tool deadline resolution (dsh timeout-policy: the tool's own
+ * declared limit wins; no limit means untouched). Values are milliseconds. */
+export interface ToolTimeoutConfig {
+  toolTimeoutMs?: Record<string, number>;
+  defaultToolTimeoutMs?: number;
+}
+export function resolveToolTimeoutMs(toolName: string, config: ToolTimeoutConfig): number | undefined {
+  const perTool = config.toolTimeoutMs?.[toolName];
+  const value = perTool !== undefined ? perTool : config.defaultToolTimeoutMs;
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.min(Math.floor(value), 3_600_000);
+}
+
+/** Timeout-shaped input fields an extension can cap at tool_call time, across
+ * foreign tools (seconds- and millisecond-denominated conventions). */
+export function timeoutFieldCaps(input: any, maxMs = 600_000): Array<{ field: string; capped: number }> {
+  if (!input || typeof input !== "object") return [];
+  const out: Array<{ field: string; capped: number }> = [];
+  for (const field of ["timeout", "timeoutSeconds", "timeout_seconds"]) {
+    if (typeof input[field] === "number" && input[field] * 1000 > maxMs) out.push({ field, capped: maxMs / 1000 });
+  }
+  for (const field of ["timeoutMs", "timeout_ms", "timeoutMillis"]) {
+    if (typeof input[field] === "number" && input[field] > maxMs) out.push({ field, capped: maxMs });
+  }
+  return out;
+}
+
+/** Fuse a caller signal with a fresh deadline (DSH `deadline()` equivalent). */
+export function fuseSignal(signal: AbortSignal | undefined, timeoutMs: number | undefined): AbortSignal | undefined {
+  if (timeoutMs === undefined) return signal;
+  const deadline = AbortSignal.timeout(timeoutMs);
+  if (!signal) return deadline;
+  const anyFn = (AbortSignal as any).any as ((signals: AbortSignal[]) => AbortSignal) | undefined;
+  if (typeof anyFn === "function") return anyFn([signal, deadline]);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal.aborted || deadline.aborted) controller.abort();
+  else { signal.addEventListener("abort", abort, { once: true }); deadline.addEventListener("abort", abort, { once: true }); }
+  return controller.signal;
+}
+
+/** Watchdog over in-flight top-level tool executions. Firing is recorded so the
+ * eventual tool_result can be annotated TOOL_TIMEOUT even when the tool settles
+ * late (cooperative tools settle on abort; uncooperative ones settle whenever). */
+export class ToolWatchdog {
+  private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private firedAt = new Map<string, { toolName: string; timeoutMs: number }>();
+  arm(toolCallId: string, toolName: string, timeoutMs: number, onFire: (toolName: string, timeoutMs: number) => void): void {
+    this.clear(toolCallId, true);
+    const timer = setTimeout(() => {
+      this.timers.delete(toolCallId);
+      this.firedAt.set(toolCallId, { toolName, timeoutMs });
+      onFire(toolName, timeoutMs);
+    }, timeoutMs);
+    if (typeof (timer as any).unref === "function") (timer as any).unref();
+    this.timers.set(toolCallId, timer);
+  }
+  /** Returns the timeout record if this call previously fired, clearing state. */
+  settle(toolCallId: string): { toolName: string; timeoutMs: number } | undefined {
+    this.clear(toolCallId, true);
+    const fired = this.firedAt.get(toolCallId);
+    this.firedAt.delete(toolCallId);
+    return fired;
+  }
+  clear(toolCallId: string, keepFired = false): void {
+    const timer = this.timers.get(toolCallId);
+    if (timer) clearTimeout(timer);
+    this.timers.delete(toolCallId);
+    if (!keepFired) this.firedAt.delete(toolCallId);
+  }
+  get active(): number { return this.timers.size; }
+}
+
+/** tmux naming/argv helpers for durable terminals (pure for tests). */
+export function tmuxSessionName(owner: string, seq: number): string {
+  const safe = owner.replace(/[^A-Za-z0-9_-]/g, "_").slice(-24);
+  return `pidsh-${safe}-${seq}`;
+}
+export function tmuxNewSessionArgs(name: string, cwd: string, shell: string): string[] {
+  return ["new-session", "-d", "-s", name, "-c", cwd, shell];
+}
+/** Literal send-keys argv per chunk; a trailing newline becomes a separate Enter. */
+export function tmuxSendKeysChunks(input: string): Array<{ literal?: string; enter?: boolean }> {
+  const chunks: Array<{ literal?: string; enter?: boolean }> = [];
+  const normalized = input.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+  lines.forEach((line, i) => {
+    if (line) chunks.push({ literal: line });
+    if (i < lines.length - 1) chunks.push({ enter: true });
+  });
+  return chunks;
+}
+
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export const SANDBOX_ORDER: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 /** Bubblewrap argv prefix confining a command. Caller appends the real argv.

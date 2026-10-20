@@ -1,6 +1,6 @@
 {
   "name": "pi-dsh-tools",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness (DSH) agent controls reimplemented for Pi: goals, todos, jobs, terminals, subagents, workflows, PTC, guards, spill, and filesystem policy.",
   "type": "module",
   "license": "MIT",
@@ -32,7 +32,9 @@
   },
   "files": [
     "src",
-    "pi-dsh.example.json"
+    "pi-dsh.example.json",
+    "dsh-compat.json",
+    "scripts/check-dsh-drift.mjs"
   ],
   "publishConfig": {
     "access": "public"
@@ -41,6 +43,7 @@
     "test": "node --experimental-strip-types --test tests/core.test.ts tests/extension.test.ts",
     "typecheck": "tsc -p tsconfig.json",
     "check": "npm run typecheck && npm test",
+    "check:drift": "node scripts/check-dsh-drift.mjs",
     "pack:dry": "npm pack --dry-run",
     "prepublishOnly": "npm run check"
   },

@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { Type } from "typebox";
-import { RepeatTracker, captureStructuredSubmission, normalizeStructured, pruneText, spillText } from "./core.ts";
+import { RepeatTracker, captureStructuredSubmission, normalizeStructured, pruneText, spillText, timeoutFieldCaps } from "./core.ts";
 
 export interface ActivationResult { childId: string; text: string; data?: unknown; status: "completed" | "failed" | "killed" }
 export interface CatalogEntry {
@@ -225,7 +225,7 @@ function createChildPolicyExtension(): (pi: any) => void {
         try { childPi.sendMessage({ customType: "pi-dsh/repeat-reminder", content: reminder, display: false }, { deliverAs: "steer" }); }
         catch { /* the next tool result still supplies the evidence */ }
       }
-      if (e.toolName === "bash" && typeof e.input?.timeout === "number" && e.input.timeout > 600) e.input.timeout = 600;
+      for (const { field, capped } of timeoutFieldCaps(e.input)) e.input[field] = capped;
       if ((e.toolName === "edit" || e.toolName === "write") && typeof e.input?.path === "string") {
         const path = resolvePath(ctx, e.input.path);
         let exists = true;

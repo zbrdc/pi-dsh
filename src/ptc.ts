@@ -6,12 +6,13 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertLosslessJson, bwrapArgs, type SandboxMode } from "./core.ts";
+import { probeSandboxRunner } from "./terminal.ts";
 
 export type PtcBindings = Record<string, Record<string, (args: any) => Promise<any>>>;
 export interface PtcRequest {
   program: string; bindings?: PtcBindings; cwd?: string;
   timeoutMs?: number | null; signal?: AbortSignal; prelude?: string;
-  stateOwner?: string; sandboxMode?: SandboxMode;
+  stateOwner?: string; sandboxMode?: SandboxMode; sandboxRunner?: string[];
 }
 export interface PtcResult {
   value?: unknown; logs: string[];
@@ -27,10 +28,11 @@ class NodeSession {
   private doneWaiters = new Map<number, (m: any) => void>();
   exited = false;
   bindingsFn: () => PtcBindings;
-  constructor(bindings: () => PtcBindings, cwd: string, sandboxMode?: SandboxMode) { this.bindingsFn = bindings;
+  constructor(bindings: () => PtcBindings, cwd: string, sandboxMode?: SandboxMode, sandboxRunner?: string[]) { this.bindingsFn = bindings;
     const sandboxed = sandboxMode !== undefined && sandboxMode !== "danger-full-access";
+    const runner = sandboxRunner && sandboxRunner.length > 0 ? sandboxRunner : ["/usr/bin/bwrap"];
     this.proc = sandboxed
-      ? fork(CHILD, [], { cwd, env: { HOME: "/tmp" }, silent: true, execPath: "/usr/bin/bwrap", execArgv: [...bwrapArgs(sandboxMode, cwd), process.execPath, "--max-old-space-size=512"] })
+      ? fork(CHILD, [], { cwd, env: { HOME: "/tmp" }, silent: true, execPath: runner[0] as string, execArgv: [...runner.slice(1), ...bwrapArgs(sandboxMode, cwd), process.execPath, "--max-old-space-size=512"] })
       : fork(CHILD, [], { cwd, env: {}, silent: true, execArgv: ["--max-old-space-size=512"] });
     this.proc.on("exit", () => { this.exited = true; });
     this.proc.on("message", async (msg: any) => {
@@ -74,8 +76,11 @@ export class NodePtcProvider {
   private chains = new Map<string, Promise<unknown>>();
 
   async run(req: PtcRequest): Promise<PtcResult> {
-    if (req.sandboxMode && req.sandboxMode !== "danger-full-access" && !existsSync("/usr/bin/bwrap")) {
+    if (req.sandboxMode && req.sandboxMode !== "danger-full-access" && !req.sandboxRunner?.length && !existsSync("/usr/bin/bwrap")) {
       return { logs: [], error: { kind: "sandbox-unavailable", message: "bubblewrap not found at /usr/bin/bwrap" } };
+    }
+    if (req.sandboxMode && req.sandboxMode !== "danger-full-access" && !probeSandboxRunner(req.sandboxRunner, req.cwd ?? process.cwd())) {
+      return { logs: [], error: { kind: "sandbox-unavailable", message: "sandbox runner failed its functional probe (fails closed)" } };
     }
     const timeoutMs = req.timeoutMs === null ? null : Math.min(Math.max(1, req.timeoutMs ?? this.timeout.defaultMs), this.timeout.maxMs);
     const namespaces: Record<string, string[]> = {};
@@ -85,11 +90,11 @@ export class NodePtcProvider {
       let persistent = false;
       if (req.stateOwner) {
         persistent = true;
-        session = this.persistent.get(req.stateOwner) ?? new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode);
-        if (session.exited) session = new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode);
+        session = this.persistent.get(req.stateOwner) ?? new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode, req.sandboxRunner);
+        if (session.exited) session = new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode, req.sandboxRunner);
         this.persistent.set(req.stateOwner, session);
       } else {
-        session = new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode);
+        session = new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode, req.sandboxRunner);
       }
       try {
         const msg = await session.run(req.program, namespaces, req.prelude ?? "", persistent, timeoutMs, req.signal);
