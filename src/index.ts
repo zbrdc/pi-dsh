@@ -1,0 +1,962 @@
+/** pi-dsh: DeepSeek Harness on-track tooling ported to Pi.
+ * One owner for todos, plan mode, goals, guards, spill/pruning, FS policy,
+ * jobs, PTY terminals, subagents, PTC run_code, and workflow. */
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readFile, writeFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
+import { Type } from "typebox";
+import {
+  RepeatTracker, spillText, pruneText, validateTodos, generateSdk,
+  newGoal, applyBlocker, renderGoalRound, renderTaskControlSection, Semaphore, completedTurnCut,
+  SANDBOX_ORDER, type TodoItem, type Goal, type SandboxMode,
+} from "./core.ts";
+import { JobRegistry } from "./jobs.ts";
+import { TerminalRegistry, PersistentBash, runShellJob } from "./terminal.ts";
+import { NodePtcProvider, MossbedProvider, PythonPtcProvider, type PtcBindings } from "./ptc.ts";
+import { SubagentManager, type CatalogEntry } from "./subagent.ts";
+
+const ENTRY = { todo: "pi-dsh/todo", plan: "pi-dsh/plan", goal: "pi-dsh/goal", catalog: "pi-dsh/catalog", team: "pi-dsh/team-tasks" };
+const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
+const errText = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details, isError: true as const });
+
+interface Config {
+  allowParallelInProgress: boolean; spillMaxInlineTokens: number; pruneThresholdChars: number;
+  ptcOnly: boolean; persistentPtc: boolean; maxActiveSubagents: number; goalBlockedThreshold: number;
+  sandboxMode: SandboxMode; maxParallelSubCalls: number;
+  completionDelivery: "wakeup" | "quiet"; maxConsecutiveWakes?: number;
+}
+function loadConfig(): Config {
+  const defaults: Config = {
+    allowParallelInProgress: true, spillMaxInlineTokens: 12500, pruneThresholdChars: 400_000,
+    ptcOnly: false, persistentPtc: false, maxActiveSubagents: 8, goalBlockedThreshold: 3,
+    sandboxMode: "danger-full-access", maxParallelSubCalls: 10, completionDelivery: "wakeup",
+  };
+  try {
+    const path = join(homedir(), ".pi", "agent", "pi-dsh.json");
+    if (existsSync(path)) return { ...defaults, ...(JSON.parse(readFileSync(path, "utf8")) as Partial<Config>) };
+  } catch { /* invalid config falls back to defaults; surfaced at session_start */ }
+  return defaults;
+}
+
+export default function (pi: any) {
+  const config = loadConfig();
+  const jobs = new JobRegistry();
+  const terminals = new TerminalRegistry();
+  const nodePtc = new NodePtcProvider();
+  const pythonPtc = new PythonPtcProvider();
+  const mossbed = new MossbedProvider();
+  jobs.setPersistRoot(join(homedir(), ".pi", "agent", "pi-dsh", "jobs"));
+  const subagents = new SubagentManager({ maxActive: config.maxActiveSubagents });
+
+  let lastCtx: any;
+  let owner = "unknown";
+  let todos: TodoItem[] = [];
+  let planActive = false;
+  let goal: Goal | undefined;
+  let humanTurn = false;
+  let wakeCount = 0;
+  let pendingGoalRound: number | undefined;
+  let lastControlSection = "";
+  interface TeamTask { id: string; subject: string; description: string; status: string; owner?: string }
+  let teamTasks: TeamTask[] = [];
+  let teamSeq = 0;
+  let persistentBash: PersistentBash | undefined;
+  let persistentPwsh: PersistentBash | undefined;
+  const repeat = new RepeatTracker([3, 5, 8]);
+  const observed = new Map<string, string>();
+  const absent = new Set<string>();
+
+  const remember = (ctx: any) => { lastCtx = ctx; try { owner = ctx.sessionManager.getSessionId(); } catch { /* keep */ } };
+  const notify = (content: string, customType = "pi-dsh/notice") => {
+    try {
+      const quiet = config.completionDelivery === "quiet";
+      const capped = config.maxConsecutiveWakes !== undefined && wakeCount >= config.maxConsecutiveWakes;
+      if (lastCtx?.isIdle?.() && !quiet && !capped) { wakeCount++; pi.sendMessage({ customType, content, display: true }, { triggerTurn: true }); }
+      else if (lastCtx?.isIdle?.()) pi.sendMessage({ customType, content, display: true }, { deliverAs: "nextTurn" });
+      else pi.sendMessage({ customType, content, display: true }, { deliverAs: "steer" });
+    } catch { /* disposed session: notice is best-effort, state is durable */ }
+  };
+  const updateGoalWidget = () => {
+    try {
+      if (lastCtx?.hasUI) lastCtx.ui.setWidget("pi-dsh-goal", goal ? [`${goal.status === "complete" ? "✔" : goal.status === "blocked" ? "⛔" : "◎"} Goal (${goal.status}, round ${goal.roundsStarted}/${goal.maxGoalRounds}): ${goal.objective.slice(0, 90)}`] : undefined);
+    } catch { /* UI gone */ }
+  };
+  /** Resolve a sandbox request against the standing mode; widening needs justification + approval. */
+  const resolveSandbox = async (ctx: any, requested?: string, justification?: string): Promise<{ mode: SandboxMode } | { error: string }> => {
+    const standing = config.sandboxMode;
+    const target = (requested as SandboxMode | undefined) ?? standing;
+    if (!(SANDBOX_ORDER as string[]).includes(target)) return { error: `unknown sandbox_permissions: ${String(target)}` };
+    if (SANDBOX_ORDER.indexOf(target) <= SANDBOX_ORDER.indexOf(standing)) return { mode: target };
+    if (!justification?.trim()) return { error: `sandbox escalation to ${target} requires a non-empty justification` };
+    if (!ctx.hasUI) return { error: `sandbox escalation to ${target} denied: no UI to approve it` };
+    const ok = await ctx.ui.confirm(`Allow sandbox escalation to ${target}?`, justification);
+    return ok ? { mode: target } : { error: `sandbox escalation to ${target} denied by user` };
+  };
+  /** Expand @file references: text files inline (capped), images as read_image pointers. */
+  const expandAttachments = (input: string, cwd: string): string => input.replace(/@(\S+\.[A-Za-z0-9]+)/g, (whole, rel) => {
+    try {
+      const path = isAbsolute(rel) ? rel : resolve(cwd, rel);
+      if (/\.(png|jpe?g|webp|gif)$/i.test(rel)) return `[attached image: ${path} — load with read_image]`;
+      const body = readFileSync(path, "utf8");
+      return body.length > 8000 ? `[attached file ${path}]\n${body.slice(0, 8000)}\n[... truncated ...]` : `[attached file ${path}]\n${body}`;
+    } catch { return whole; }
+  });
+  const currentControlSection = () => renderTaskControlSection({ goal, todos, planActive });
+  const persistGoal = () => { if (goal) pi.appendEntry(ENTRY.goal, goal); updateGoalWidget(); };
+  const hashFile = async (path: string) => createHash("sha256").update(await readFile(path)).digest("hex");
+  const resolvePath = (ctx: any, p: string) => (isAbsolute(p) ? p : resolve(ctx.cwd, p));
+
+  function restore(ctx: any) {
+    remember(ctx);
+    todos = []; planActive = false; goal = undefined; teamTasks = []; pendingGoalRound = undefined; observed.clear(); absent.clear();
+    const catalog: CatalogEntry[] = [];
+    for (const e of ctx.sessionManager.getBranch()) {
+      if (e.type !== "custom") continue;
+      if (e.customType === ENTRY.todo) todos = (e.data as TodoItem[]) ?? [];
+      if (e.customType === ENTRY.plan) planActive = Boolean((e.data as any)?.active);
+      if (e.customType === ENTRY.goal) goal = e.data as Goal;
+      if (e.customType === ENTRY.team) { teamTasks = (e.data as TeamTask[]) ?? []; teamSeq = teamTasks.length; }
+      if (e.customType === ENTRY.catalog) {
+        const entry = e.data as CatalogEntry;
+        const i = catalog.findIndex((c) => c.childId === entry.childId);
+        if (i >= 0) catalog[i] = entry; else catalog.push(entry);
+      }
+    }
+    subagents.restore(catalog);
+    jobs.restore(owner);
+    updateGoalWidget();
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("pi-dsh", `dsh${goal && goal.status === "active" ? ` · goal r${goal.roundsStarted}` : ""}${planActive ? " · plan" : ""}`);
+      ctx.ui.setWidget("pi-dsh-todo", todos.length ? todos.map((t) => `${t.status === "completed" ? "✔" : t.status === "in_progress" ? "▶" : "○"} ${t.content}`) : undefined);
+    }
+  }
+
+  pi.on("session_start", async (_e: any, ctx: any) => restore(ctx));
+  pi.on("session_tree", async (_e: any, ctx: any) => restore(ctx));
+  pi.on("session_compact", async (_e: any, ctx: any) => {
+    remember(ctx);
+    // Compaction summaries are derivative; force the authoritative goal/todo
+    // snapshot back into the next request even if it has not changed.
+    lastControlSection = "";
+    updateGoalWidget();
+  });
+  pi.on("session_shutdown", async () => {
+    await jobs.disposeOwner(owner, { keepDurable: true }).catch(() => undefined);
+    await terminals.disposeOwner(owner).catch(() => undefined);
+    await subagents.disposeOwner(owner).catch(() => undefined);
+    nodePtc.disposeAll();
+  });
+  pi.on("input", async (e: any, ctx: any) => {
+    remember(ctx);
+    if (e.source !== "extension") { humanTurn = true; repeat.reset(); wakeCount = 0; }
+  });
+  pi.on("turn_start", async (_e: any, ctx: any) => {
+    remember(ctx);
+    // A queued goal round counts only once its turn actually starts (admission).
+    if (goal && pendingGoalRound !== undefined) {
+      goal.roundsStarted = pendingGoalRound; pendingGoalRound = undefined; persistGoal();
+    }
+    updateGoalWidget();
+  });
+  pi.on("before_agent_start", async (e: any, ctx: any) => {
+    remember(ctx);
+    const control = currentControlSection();
+    e.systemPromptOptions.sections["pi_dsh"] = control;
+    lastControlSection = control;
+    if (!planActive) return undefined;
+    return { message: {
+      customType: "pi-dsh/plan", display: false,
+      content: "Plan mode is active. Explore and design before executing. Do not make changes yet. When the plan is complete, call exit_plan_mode with the full plan as markdown for user review.",
+    } };
+  });
+
+  // ---- Guards, FS policy (tool_call) ----
+  pi.on("tool_call", async (e: any, ctx: any) => {
+    remember(ctx);
+    const reminder = repeat.observe(e.toolName, e.input);
+    if (reminder) notify(reminder, "pi-dsh/repeat-reminder");
+    if (e.toolName === "bash" && typeof e.input?.timeout === "number" && e.input.timeout > 600) e.input.timeout = 600;
+    if ((e.toolName === "edit" || e.toolName === "write") && typeof e.input?.path === "string") {
+      const path = resolvePath(ctx, e.input.path);
+      let exists = true;
+      try { await stat(path); } catch { exists = false; }
+      if (!exists) {
+        if (e.toolName === "edit") return { block: true, reason: `FS_NOT_FOUND: cannot edit "${path}": file does not exist — create it with write, then retry` };
+        return undefined; // creating needs no observation
+      }
+      const seen = observed.get(path);
+      if (seen === undefined) return { block: true, reason: `FS_NOT_OBSERVED: cannot modify "${path}": file has not been read — read the file, then retry` };
+      const now = await hashFile(path).catch(() => "");
+      if (now !== seen) return { block: true, reason: `FS_STALE_VERSION: "${path}" changed since it was read — re-read the file, then retry` };
+    }
+    return undefined;
+  });
+
+  // ---- Spill + observation recording (tool_result) ----
+  pi.on("tool_result", async (e: any, ctx: any) => {
+    remember(ctx);
+    if (e.toolName === "read" && typeof e.input?.path === "string") {
+      const path = resolvePath(ctx, e.input.path);
+      const h = await hashFile(path).catch(() => undefined);
+      if (h !== undefined && !e.isError) { observed.set(path, h); absent.delete(path); }
+      else { absent.add(path); observed.delete(path); }
+    }
+    if ((e.toolName === "edit" || e.toolName === "write") && !e.isError && typeof e.input?.path === "string") {
+      const path = resolvePath(ctx, e.input.path);
+      const h = await hashFile(path).catch(() => undefined);
+      if (h !== undefined) { observed.set(path, h); absent.delete(path); }
+    }
+    const imageBlocks = (e.content ?? []).filter((c: any) => c.type === "image");
+    if (imageBlocks.length > 0 && !e.isError) {
+      const textNow = (e.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+      const estTokens = Math.ceil(textNow.length / 4) + imageBlocks.length * 1500;
+      if (estTokens > config.spillMaxInlineTokens) {
+        const dir = join(homedir(), ".pi", "agent", "pi-dsh", "spill", owner);
+        try {
+          mkdirSync(dir, { recursive: true });
+          const content = [];
+          let n = 0;
+          for (const c of e.content ?? []) {
+            if (c.type !== "image") { content.push(c); continue; }
+            const ext = c.mimeType === "image/jpeg" ? "jpg" : c.mimeType === "image/webp" ? "webp" : c.mimeType === "image/gif" ? "gif" : "png";
+            const file = join(dir, `${String(e.toolCallId).replace(/[^A-Za-z0-9_-]/g, "_")}-${n++}.${ext}`);
+            writeFileSync(file, Buffer.from(c.data ?? "", "base64"));
+            content.push({ type: "text", text: `[image spilled to ${file}; load it with read_image]` });
+          }
+          return { content, structuredContent: e.structuredContent, details: e.details };
+        } catch { /* leave original */ }
+      }
+    }
+    const joined = (e.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+    if (joined.length > config.spillMaxInlineTokens * 4 && !e.isError) {
+      const dir = join(homedir(), ".pi", "agent", "pi-dsh", "spill", owner);
+      const file = join(dir, `${String(e.toolCallId).replace(/[^A-Za-z0-9_-]/g, "_")}.txt`);
+      let locator = file;
+      try { mkdirSync(dir, { recursive: true }); writeFileSync(file, joined, "utf8"); }
+      catch { return undefined; } // recovery failure leaves original content (dsh spill-policy)
+      const spilled = spillText(joined, config.spillMaxInlineTokens, locator);
+      if (spilled.spilled) return { content: [{ type: "text", text: spilled.text }], structuredContent: e.structuredContent, details: e.details };
+    }
+    return undefined;
+  });
+
+  // ---- Pruner (context) ----
+  pi.on("context", async (e: any) => {
+    const size = JSON.stringify(e.messages).length;
+    if (size < config.pruneThresholdChars) {
+      const control = currentControlSection();
+      if ((goal || todos.some((t) => t.status !== "completed") || planActive) && control !== lastControlSection) {
+        lastControlSection = control;
+        return { messages: [...e.messages, {
+          role: "custom", customType: "pi-dsh/control", display: false, timestamp: Date.now(),
+          content: [{ type: "text", text: `<pi_dsh>\n${control}\n</pi_dsh>` }],
+        }] };
+      }
+      return undefined;
+    }
+    const toolIdx = e.messages.map((m: any, i: number) => (m.role === "toolResult" ? i : -1)).filter((i: number) => i >= 0);
+    const keepFrom = toolIdx.length > 6 ? (toolIdx[toolIdx.length - 6] as number) : Number.POSITIVE_INFINITY;
+    let changed = false;
+    const messages = [];
+    const offloadDir = join(homedir(), ".pi", "agent", "pi-dsh", "spill", owner);
+    for (let i = 0; i < e.messages.length; i++) {
+      const m = e.messages[i];
+      const isOld = i < keepFrom;
+      if ((m.role !== "toolResult" && m.role !== "user") || !isOld) { messages.push(m); continue; }
+      const content = [];
+      for (const c of m.content ?? []) {
+        if (c.type === "image" && typeof c.data === "string") {
+          try {
+            mkdirSync(offloadDir, { recursive: true });
+            const ext = c.mimeType === "image/jpeg" ? "jpg" : "png";
+            const file = join(offloadDir, `offload-${i}-${content.length}.${ext}`);
+            writeFileSync(file, Buffer.from(c.data, "base64"));
+            changed = true;
+            content.push({ type: "text", text: `[image offloaded under context pressure: ${file}; load with read_image]` });
+            continue;
+          } catch { /* keep inline */ }
+        }
+        if (m.role === "toolResult" && c.type === "text" && c.text.length > 8000) {
+          changed = true; content.push({ ...c, text: pruneText(c.text, 8000) }); continue;
+        }
+        content.push(c);
+      }
+      messages.push({ ...m, content });
+    }
+    const control = currentControlSection();
+    if ((goal || todos.some((t) => t.status !== "completed") || planActive) && control !== lastControlSection) {
+      lastControlSection = control;
+      messages.push({
+        role: "custom", customType: "pi-dsh/control", display: false, timestamp: Date.now(),
+        content: [{ type: "text", text: `<pi_dsh>\n${control}\n</pi_dsh>` }],
+      });
+      changed = true;
+    }
+    return changed ? { messages } : undefined;
+  });
+
+  // ---- todo_write ----
+  pi.registerTool({
+    name: "todo_write", label: "Todo write",
+    description: "Maintain a structured task list: break multi-step work into concrete tasks, mark actively worked tasks in_progress, check tasks off as they finish. Send the COMPLETE list on every update; it replaces the previous list. Several tasks may be in_progress at once.",
+    promptSnippet: "Replace the whole task list",
+    parameters: Type.Object({ todos: Type.Array(Type.Object({
+      content: Type.String(), status: Type.Union([Type.Literal("pending"), Type.Literal("in_progress"), Type.Literal("completed")]),
+    })) }),
+    async execute(_id: string, params: any, _sig: unknown, _upd: unknown, ctx: any) {
+      remember(ctx);
+      try { todos = validateTodos(params.todos, config.allowParallelInProgress); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+      pi.appendEntry(ENTRY.todo, todos);
+      if (ctx.hasUI) ctx.ui.setWidget("pi-dsh-todo", todos.map((t) => `${t.status === "completed" ? "✔" : t.status === "in_progress" ? "▶" : "○"} ${t.content}`));
+      const n = (s: string) => todos.filter((t) => t.status === s).length;
+      return text(`Updated todo list: ${n("pending")} pending, ${n("in_progress")} in progress, ${n("completed")} completed.`);
+    },
+  });
+
+  // ---- Plan mode ----
+  pi.registerCommand("plan", {
+    description: "Enter or leave plan mode (/plan, /plan off)",
+    handler: async (args: string, ctx: any) => {
+      remember(ctx);
+      if (args.trim() === "off") { planActive = false; pi.appendEntry(ENTRY.plan, { active: false }); ctx.ui.notify("Plan mode off"); return; }
+      planActive = true; pi.appendEntry(ENTRY.plan, { active: true });
+      ctx.ui.notify("Plan mode on");
+      // A custom message entry (not only a custom entry) so a fresh session persists its file.
+      pi.sendMessage({ customType: "pi-dsh/plan", content: "Plan mode is active: explore and design, then present the plan with exit_plan_mode.", display: true });
+      if (args.trim()) pi.sendUserMessage(args.trim());
+    },
+  });
+  pi.registerTool({
+    name: "exit_plan_mode", label: "Exit plan mode", exposure: "model-only",
+    description: "Present the completed plan for user review. Only callable in plan mode. Approval leaves plan mode and the plan is carried out from the next step; rejection returns feedback and planning continues.",
+    promptSnippet: "Present plan for review",
+    parameters: Type.Object({ plan: Type.String() }),
+    async execute(_id: string, params: any, _sig: unknown, _upd: unknown, ctx: any) {
+      remember(ctx);
+      if (!planActive) return errText("Error: exit_plan_mode called outside plan mode");
+      let approved = true; let feedback = "";
+      if (ctx.hasUI) {
+        const choice = await ctx.ui.select(`Plan review\n\n${params.plan}`, ["Approve — carry out the plan", "Keep planning — send feedback"]);
+        approved = choice?.startsWith("Approve") ?? false;
+        if (!approved) feedback = (await ctx.ui.input("Feedback for the plan", "What should change?")) ?? "";
+      }
+      if (!approved) return text(`User kept plan mode active. Feedback: ${feedback || "(none)"}. Revise the plan and call exit_plan_mode again.`);
+      planActive = false; pi.appendEntry(ENTRY.plan, { active: false });
+      return text("Plan approved. Plan mode is now inactive; carry out the plan from the next step.");
+    },
+  });
+
+  // ---- read_image ----
+  pi.registerTool({
+    name: "read_image", label: "Read image",
+    description: "Read a PNG/JPEG/WebP/GIF image file and return it for visual inspection. Extension-less paths are identified by file signature.",
+    parameters: Type.Object({ file_path: Type.String() }),
+    async execute(_id: string, params: any, _sig: unknown, _upd: unknown, ctx: any) {
+      remember(ctx);
+      const path = resolvePath(ctx, params.file_path);
+      let bytes: Buffer;
+      try { bytes = await readFile(path); } catch { return errText(`Error: FS_NOT_FOUND: cannot read image "${path}"`); }
+      if (bytes.length > 10 * 1024 * 1024) return errText(`Error: image too large (${bytes.length} bytes)`);
+      const sig = bytes.subarray(0, 12);
+      let mime: string | undefined;
+      if (sig[0] === 0x89 && sig[1] === 0x50) mime = "image/png";
+      else if (sig[0] === 0xff && sig[1] === 0xd8) mime = "image/jpeg";
+      else if (sig.toString("ascii", 0, 4) === "RIFF" && sig.toString("ascii", 8, 12) === "WEBP") mime = "image/webp";
+      else if (sig.toString("ascii", 0, 3) === "GIF") mime = "image/gif";
+      if (!mime) return errText(`Error: unsupported image signature in "${path}"`);
+      observed.set(path, createHash("sha256").update(bytes).digest("hex"));
+      return { content: [
+        { type: "text" as const, text: `Image: ${path} (${mime}, ${bytes.length} bytes)` },
+        { type: "image" as const, data: bytes.toString("base64"), mimeType: mime },
+      ], details: {} };
+    },
+  });
+
+  // ---- Jobs + bash ----
+  jobs.onSettle = (snap, info) => {
+    if (info.owner !== owner || info.awaited || info.killRequested) return;
+    notify(`background job ${snap.id} (${snap.kind}: ${snap.label}) finished [status: ${snap.status}]. Read its output with job_output.`, "pi-dsh/job-complete");
+  };
+  pi.registerTool({
+    name: "job_output", label: "Job output", description: "Read a background job's output since the previous read. wait=true blocks up to timeout_ms (capped) and leaves a running job alive.",
+    parameters: Type.Object({ job_id: Type.String(), wait: Type.Optional(Type.Boolean()), timeout_ms: Type.Optional(Type.Number()) }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { const r = await jobs.output(p.job_id, owner, { wait: p.wait, timeoutMs: p.timeout_ms }); return text(r.text); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "job_list", label: "Job list", description: "List your background jobs with ids, kinds, and statuses.",
+    parameters: Type.Object({}),
+    async execute(_id: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const rows = jobs.list(owner).map((j) => `${j.id} [${j.kind}] ${j.status}${j.progress ? ` — ${j.progress}` : ` — ${j.label}`}`);
+      return text(rows.length ? rows.join("\n") : "No background jobs.");
+    },
+  });
+  pi.registerTool({
+    name: "job_kill", label: "Job kill", description: "Cancel a running background job; settles once the work actually stops.",
+    parameters: Type.Object({ job_id: Type.String(), reason: Type.Optional(Type.String()) }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { const r = await jobs.kill(p.job_id, owner, p.reason); return text(`${r.outcome}: ${r.job.id} [status: ${r.job.status}]`); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+
+  const startBashJob = (command: string, cwd: string, description: string, sandboxMode: SandboxMode, shell = "bash") => {
+    // Durable output lives under the workspace (reachable inside the sandbox too).
+    const dir = join(cwd, ".pi-dsh", "jobs");
+    const stamp = `bash-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const outFile = join(dir, `${stamp}.out`); const exitFile = join(dir, `${stamp}.exit`);
+    try { mkdirSync(dir, { recursive: true }); } catch { /* shell will report */ }
+    return jobs.start({
+      kind: "bash", label: description || command.slice(0, 60), owner, durable: { outFile, exitFile },
+      run: async (h) => {
+        let offset = 0;
+        const poll = setInterval(() => {
+          try {
+            const body = readFileSync(outFile, "utf8");
+            if (body.length > offset) { h.append(body.slice(offset)); offset = body.length; }
+          } catch { /* not created yet */ }
+        }, 250);
+        try {
+          await runShellJob({ command, cwd, signal: h.signal, append: (t) => h.append(t), sandboxMode, shell, outFile, exitFile });
+        } finally { clearInterval(poll); }
+        try { const body = readFileSync(outFile, "utf8"); if (body.length > offset) h.append(body.slice(offset)); } catch { /* gone */ }
+        let code = "0";
+        try { code = readFileSync(exitFile, "utf8").trim(); } catch { /* killed before writing */ }
+        if (code !== "0" && code !== "") h.append(`\n[exit code: ${code}]\n`);
+        return {};
+      },
+    });
+  };
+  pi.registerTool({
+    name: "bash", label: "Bash (pi-dsh)",
+    description: "Run a Bash command in a fresh shell. State does not persist; pass workdir instead of cd. With run_in_background, returns a job id at once. A foreground command that outlives timeout is promoted to its background job (same id); collect it with job_output. Verify the resolved absolute target path before any delete or move, and guard variables in such paths with ${VAR:?}.",
+    promptSnippet: "Run a bash command (job-aware)",
+    parameters: Type.Object({
+      command: Type.String(), description: Type.Optional(Type.String()),
+      timeout: Type.Optional(Type.Number()), workdir: Type.Optional(Type.String()),
+      run_in_background: Type.Optional(Type.Boolean()),
+      sandbox_permissions: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write"), Type.Literal("danger-full-access")])),
+      justification: Type.Optional(Type.String()),
+    }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const sb = await resolveSandbox(ctx, p.sandbox_permissions, p.justification);
+      if ("error" in sb) return errText(`Error: ${sb.error}`);
+      const cwd = p.workdir ? resolvePath(ctx, p.workdir) : ctx.cwd;
+      const jobId = startBashJob(p.command, cwd, p.description ?? "", sb.mode);
+      if (p.run_in_background) return text(`started background job ${jobId}`);
+      const timeoutMs = Math.min(Math.max(1, (p.timeout ?? 120)) * 1000, 600_000);
+      const r = await jobs.output(jobId, owner, { wait: true, timeoutMs });
+      if (r.job.status === "running") return text(`${r.text}\n[command still running as background job ${jobId}; read it with job_output]`);
+      return text(r.text.replace(/\n\[status: \w+\]$/, ""));
+    },
+  });
+  pi.registerTool({
+    name: "bash_persistent", label: "Bash persistent",
+    description: "Run a command in a persistent Bash shell. cwd, exported variables, and functions persist across calls for this agent. exit, timeout, or cancellation resets the shell. Interactive stdin is unsupported; use terminal tools for that.",
+    parameters: Type.Object({ command: Type.String(), timeout_ms: Type.Optional(Type.Number()) }),
+    executionMode: "sequential",
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      persistentBash ??= new PersistentBash(terminals, owner, ctx.cwd);
+      const r = await persistentBash.run(p.command, p.timeout_ms ?? 300_000);
+      return text(r.text);
+    },
+  });
+
+  // ---- Terminal tools ----
+  const termParams = (extra: Record<string, unknown> = {}) => Type.Object({ terminal_id: Type.String(), ...extra });
+  pi.registerTool({
+    name: "terminal_open", label: "Terminal open", description: "Open a persistent PTY terminal session owned by this agent.",
+    parameters: Type.Object({ label: Type.Optional(Type.String()) }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const s = await terminals.open(owner, { cwd: ctx.cwd, label: p.label });
+      return text(`opened terminal ${s.id}`);
+    },
+  });
+  pi.registerTool({
+    name: "terminal_send", label: "Terminal send", description: "Send input to a PTY terminal. run_in_background registers the send as a job.",
+    parameters: termParams({ input: Type.String(), run_in_background: Type.Optional(Type.Boolean()) }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try {
+        const s = terminals.get(owner, p.terminal_id);
+        terminals.send(owner, p.terminal_id, p.input);
+        if (p.run_in_background) {
+          const jobId = jobs.start({ kind: "terminal", label: p.input.slice(0, 60), owner,
+            run: async (h) => { const iv = setInterval(() => { const out = s.ring.readNew(); if (out) h.append(out); }, 250); await s.exited; clearInterval(iv); h.append(s.ring.readNew()); } });
+          return text(`sent; background job ${jobId}`);
+        }
+        await new Promise((r) => setTimeout(r, 500));
+        return text(s.ring.readNew() || "(no output yet)");
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "terminal_read", label: "Terminal read", description: "Read new output from a PTY terminal.",
+    parameters: termParams(),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { return text(terminals.get(owner, p.terminal_id).ring.readNew() || "(no new output)"); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "terminal_list", label: "Terminal list", description: "List this agent's PTY terminals.",
+    parameters: Type.Object({}),
+    async execute(_id: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const rows = terminals.list(owner).map((t) => `${t.id} ${t.alive ? "alive" : "exited"} — ${t.label}`);
+      return text(rows.length ? rows.join("\n") : "No terminals.");
+    },
+  });
+  pi.registerTool({
+    name: "terminal_close", label: "Terminal close", description: "Close a PTY terminal.",
+    parameters: termParams(),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { await terminals.close(owner, p.terminal_id); return text(`closed terminal ${p.terminal_id}`); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "terminal_signal", label: "Terminal signal", description: "Send a signal (for example SIGINT) to a PTY terminal's process.",
+    parameters: termParams({ signal: Type.String() }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { terminals.signal(owner, p.terminal_id, p.signal); return text(`sent ${p.signal} to ${p.terminal_id}`); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+
+  pi.registerTool({
+    name: "terminal_resize", label: "Terminal resize", description: "Resize a PTY terminal (node-pty backend only).",
+    parameters: termParams({ cols: Type.Number(), rows: Type.Number() }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { terminals.resize(owner, p.terminal_id, Math.max(1, Math.floor(p.cols)), Math.max(1, Math.floor(p.rows))); return text(`resized ${p.terminal_id} to ${Math.floor(p.cols)}x${Math.floor(p.rows)}`); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  // PowerShell tools register only when a pwsh/powershell binary exists (Windows-shaped hosts).
+  const pwshBin = ["/usr/bin/pwsh", "/usr/local/bin/pwsh"].find((f) => existsSync(f));
+  if (pwshBin) {
+    pi.registerTool({
+      name: "pwsh", label: "PowerShell",
+      description: "Run a PowerShell command in a fresh process with native paths and $env: variables. Job-aware like bash.",
+      parameters: Type.Object({ command: Type.String(), description: Type.Optional(Type.String()), timeout: Type.Optional(Type.Number()), workdir: Type.Optional(Type.String()), run_in_background: Type.Optional(Type.Boolean()) }),
+      async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+        remember(ctx);
+        const cwd = p.workdir ? resolvePath(ctx, p.workdir) : ctx.cwd;
+        const jobId = startBashJob(p.command, cwd, p.description ?? "", config.sandboxMode, pwshBin);
+        if (p.run_in_background) return text(`started background job ${jobId}`);
+        const r = await jobs.output(jobId, owner, { wait: true, timeoutMs: Math.min(Math.max(1, (p.timeout ?? 120)) * 1000, 600_000) });
+        return text(r.job.status === "running" ? `${r.text}\n[still running as job ${jobId}]` : r.text.replace(/\n\[status: \w+\]$/, ""));
+      },
+    });
+    pi.registerTool({
+      name: "pwsh_persistent", label: "PowerShell persistent",
+      description: "Run a command in a persistent PowerShell session (state persists across calls).",
+      parameters: Type.Object({ command: Type.String(), timeout_ms: Type.Optional(Type.Number()) }),
+      executionMode: "sequential",
+      async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+        remember(ctx);
+        persistentPwsh ??= new PersistentBash(terminals, owner, ctx.cwd, pwshBin);
+        return text((await persistentPwsh.run(p.command, p.timeout_ms ?? 300_000)).text);
+      },
+    });
+  }
+
+  // ---- Subagents ----
+  subagents.onCatalog = (entry) => { try { pi.appendEntry(ENTRY.catalog, entry); } catch { /* session gone */ } };
+  subagents.onSettle = (entry, result, delivery) => {
+    if (entry.owner !== owner || delivery !== "parent") return;
+    notify(`subagent ${entry.childId} (${entry.provider}: ${entry.label}) finished [status: ${result.status}]. Final answer:\n${result.text.slice(0, 8000)}`, "pi-dsh/subagent-complete");
+  };
+  const delegate = (provider: "spawn" | "fork", name: string, contextNote: string) => pi.registerTool({
+    name, label: `Subagent (${provider})`, exposure: "model-only" as const,
+    description: `Delegate work to a fresh child agent and return its id immediately; the final answer arrives in a completion notice. ${contextNote} The child shares the workspace. Use for bounded, self-contained subtasks.`,
+    parameters: Type.Object({ task: Type.String(), label: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()) }),
+    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try {
+        let seedMessages: any[] | undefined;
+        if (provider === "fork") {
+          const msgs = ctx.sessionManager.getBranch()
+            .filter((e: any) => e.type === "message").map((e: any) => e.message);
+          seedMessages = msgs.slice(0, completedTurnCut(msgs));
+        }
+        const childId = await subagents.start({
+          provider, label: p.label ?? "task", task: p.task, owner,
+          cwd: p.cwd ? resolvePath(ctx, p.cwd) : ctx.cwd, model: ctx.model,
+          seedMessages, delivery: "parent",
+        });
+        return text(`started subagent ${childId}`);
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  delegate("spawn", "subagent", "It does NOT see this conversation; the task must stand alone.");
+  delegate("fork", "subagent_fork", "It sees this conversation's completed turns, but NOT the current in-flight turn.");
+  pi.registerTool({
+    name: "send_message", label: "Send message (subagent)", exposure: "model-only",
+    description: "Send a follow-up message to a continuable child subagent (steers if working, resumes if settled).",
+    parameters: Type.Object({ child_id: Type.String(), message: Type.String() }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { return text(await subagents.sendMessage(p.child_id, p.message)); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "interrupt_agent", label: "Interrupt agent", exposure: "model-only",
+    description: "Interrupt a running child subagent and wait for it to settle.",
+    parameters: Type.Object({ child_id: Type.String() }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { await subagents.interrupt(p.child_id); return text(`interrupted subagent ${p.child_id}`); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "list_agents", label: "List agents", exposure: "model-only",
+    description: "List child subagents of this session from the catalog (does not load transcripts).",
+    parameters: Type.Object({}),
+    async execute(_i: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const rows = subagents.list(owner).map((e) => `${e.childId} [${e.provider}] ${e.status} — ${e.label}`);
+      return text(rows.length ? rows.join("\n") : "No subagents.");
+    },
+  });
+
+  // ---- Agent teams (experimental tool-agent-team shape) ----
+  const persistTeam = () => { try { pi.appendEntry(ENTRY.team, teamTasks); } catch { /* gone */ } };
+  pi.registerTool({
+    name: "spawn_teammate", label: "Spawn teammate", exposure: "model-only",
+    description: "Spawn a continuable teammate subagent on this session's team. Returns its id; results arrive as completion notices, or via wait_agent.",
+    parameters: Type.Object({ name: Type.String(), task: Type.String() }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try {
+        const childId = await subagents.start({
+          provider: "spawn", label: `team:${p.name}`, task: p.task, owner, cwd: ctx.cwd, model: ctx.model, delivery: "parent",
+          systemAppend: `You are teammate "${p.name}" on a shared team in this workspace. Coordinate through the shared files; finish by summarizing what you did and what remains.`,
+        });
+        return text(`spawned teammate ${p.name}: ${childId}`);
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "wait_agent", label: "Wait agent", exposure: "model-only",
+    description: "Wait for a subagent/teammate to settle and return its final answer.",
+    parameters: Type.Object({ child_id: Type.String() }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try { const r = await subagents.wait(p.child_id); return text(`[${r.status}] ${r.text}`); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "team_task_create", label: "Team task create", exposure: "model-only",
+    description: "Create a durable shared team task.",
+    parameters: Type.Object({ subject: Type.String(), description: Type.Optional(Type.String()) }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const t = { id: `task-${++teamSeq}`, subject: String(p.subject), description: String(p.description ?? ""), status: "pending" };
+      teamTasks.push(t); persistTeam();
+      return text(`created ${t.id}: ${t.subject}`);
+    },
+  });
+  pi.registerTool({
+    name: "team_task_list", label: "Team task list", exposure: "model-only",
+    description: "List durable shared team tasks with owners and statuses.",
+    parameters: Type.Object({}),
+    async execute(_i: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      return text(teamTasks.length ? teamTasks.map((t) => `${t.id} [${t.status}]${t.owner ? ` @${t.owner}` : ""} ${t.subject}`).join("\n") : "No team tasks.");
+    },
+  });
+  pi.registerTool({
+    name: "team_task_get", label: "Team task get", exposure: "model-only",
+    description: "Read one team task in full.",
+    parameters: Type.Object({ task_id: Type.String() }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const t = teamTasks.find((x) => x.id === p.task_id);
+      return t ? text(`${t.id} [${t.status}]${t.owner ? ` @${t.owner}` : ""}\n${t.subject}\n${t.description}`) : errText(`Error: unknown task ${p.task_id}`);
+    },
+  });
+  pi.registerTool({
+    name: "team_task_update", label: "Team task update", exposure: "model-only",
+    description: "Update a team task status (pending|in_progress|completed) and/or owner claim.",
+    parameters: Type.Object({ task_id: Type.String(), status: Type.Optional(Type.String()), owner: Type.Optional(Type.String()) }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      const t = teamTasks.find((x) => x.id === p.task_id);
+      if (!t) return errText(`Error: unknown task ${p.task_id}`);
+      if (p.status) t.status = String(p.status);
+      if (p.owner !== undefined) t.owner = String(p.owner);
+      persistTeam();
+      return text(`updated ${t.id}: [${t.status}]${t.owner ? ` @${t.owner}` : ""}`);
+    },
+  });
+
+  // ---- Goals ----
+  const requireHuman = () => {
+    if (!humanTurn) throw new Error("goal create/edit/pause/resume requires a direct human request in a top-level turn");
+  };
+  const cas = (p: any) => {
+    if (!goal) throw new Error("no goal exists");
+    if (p.goal_id !== goal.id || p.revision !== goal.revision) throw new Error(`stale goal view: current is id=${goal.id} revision=${goal.revision}; call get_goal first`);
+    return goal;
+  };
+  pi.registerTool({
+    name: "create_goal", label: "Create goal", exposure: "model-only",
+    description: "Create the session's single long-running goal from a direct human request. The goal persists across turns and auto-continues while armed.",
+    parameters: Type.Object({ objective: Type.String(), max_rounds: Type.Optional(Type.Number()) }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try {
+        requireHuman();
+        goal = newGoal(`goal-${Date.now()}`, expandAttachments(String(p.objective), ctx.cwd), p.max_rounds ?? 256);
+        persistGoal();
+        return text(`Created goal ${goal.id} revision ${goal.revision}: ${goal.objective}`);
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerTool({
+    name: "get_goal", label: "Get goal", exposure: "model-only",
+    description: "Read the current persisted goal (id, revision, objective, status, rounds).",
+    parameters: Type.Object({}),
+    async execute(_i: string, _p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      return text(goal ? `id=${goal.id} revision=${goal.revision} status=${goal.status} rounds=${goal.roundsStarted}/${goal.maxGoalRounds} armed=${goal.armed}\nObjective: ${goal.objective}${goal.blocker ? `\nBlocker: ${goal.blocker} (x${goal.blockerRounds})` : ""}` : "No goal.");
+    },
+  });
+  pi.registerTool({
+    name: "update_goal", label: "Update goal", exposure: "model-only",
+    description: "Update the goal. Requires exact goal_id and revision from get_goal. action: edit|pause|resume|complete|block. complete triggers an independent reviewer audit; rejected completions stay active with feedback. block needs the same concrete blocker for 3 consecutive rounds.",
+    parameters: Type.Object({
+      goal_id: Type.String(), revision: Type.Number(),
+      action: Type.Union([Type.Literal("edit"), Type.Literal("pause"), Type.Literal("resume"), Type.Literal("complete"), Type.Literal("block")]),
+      objective: Type.Optional(Type.String()), blocker: Type.Optional(Type.String()), evidence: Type.Optional(Type.String()),
+    }),
+    async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+      remember(ctx);
+      try {
+        const g = cas(p);
+        if (p.action === "edit" || p.action === "pause" || p.action === "resume") requireHuman();
+        if (p.action === "edit") { if (p.objective) g.objective = String(p.objective); g.revision++; }
+        if (p.action === "pause") { g.status = "paused"; g.armed = false; g.revision++; }
+        if (p.action === "resume") { g.status = "active"; g.armed = true; g.blockerRounds = 0; g.revision++; }
+        if (p.action === "block") {
+          if (!p.blocker) throw new Error("block requires a concrete blocker string");
+          goal = applyBlocker(g, String(p.blocker), config.goalBlockedThreshold); persistGoal();
+          return text(goal.status === "blocked" ? `Goal blocked after ${config.goalBlockedThreshold} consecutive rounds: ${goal.blocker}` : `Blocker recorded (${goal.blockerRounds}/${config.goalBlockedThreshold}); goal stays active.`);
+        }
+        if (p.action === "complete") {
+          g.status = "auditing"; g.revision++; persistGoal();
+          const reviewerId = await subagents.start({
+            provider: "spawn", label: "goal-auditor", owner, cwd: ctx.cwd, model: ctx.model, delivery: "caller",
+            tools: ["read", "grep", "find", "ls", "bash", "structured_output"], requireStructured: true,
+            outputSchema: {
+              type: "object",
+              properties: {
+                verdict: { type: "string", enum: ["accept", "reject"] },
+                gaps: { type: "string", description: "What is missing or wrong; empty when accepting." },
+                summary: { type: "string" },
+                evidence: {},
+              },
+              required: ["verdict", "gaps"],
+            },
+            task: `You are an independent auditor. Verify whether this goal is genuinely complete in the current workspace: ${JSON.stringify(g.objective)}. Claimed evidence: ${JSON.stringify(p.evidence ?? "")}. Inspect the workspace yourself. You MUST finish by calling the structured_output tool exactly once with verdict set to "accept" or "reject" and gaps set to what is missing or wrong (empty if accepting). Do not only answer in prose.`,
+          });
+          const res = await subagents.wait(reviewerId);
+          let data = res.data as { verdict?: string; gaps?: string } | undefined;
+          if (data?.verdict === undefined) {
+            // The auditor is an independent agent; accept its explicit JSON verdict from text as a fallback.
+            const m = res.text.match(/\{\s*"verdict"\s*:\s*"(accept|reject)"[^}]*\}/);
+            if (m) { try { data = JSON.parse(m[0]) as { verdict?: string; gaps?: string }; } catch { data = { verdict: m[1], gaps: "" }; } }
+            else if (/verdict[:\s*]+accept\b/i.test(res.text) && !/verdict[:\s*]+reject\b/i.test(res.text)) data = { verdict: "accept", gaps: "" };
+          }
+          if (data?.verdict === "accept") {
+            g.status = "complete"; g.armed = false; g.revision++; persistGoal();
+            return text("Goal completion accepted by auditor. Goal marked complete.");
+          }
+          g.status = "active"; g.revision++; persistGoal();
+          return text(`Completion REJECTED by auditor. Gaps: ${data?.gaps ?? res.text.slice(0, 2000)}. Keep working; do not claim completion until these are addressed.`);
+        }
+        persistGoal();
+        return text(`Goal updated: status=${g.status} revision=${g.revision}.`);
+      } catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+    },
+  });
+  pi.registerCommand("goal", {
+    description: "Inspect or control the session goal (/goal status|pause|resume|clear|<objective>)",
+    handler: async (args: string, ctx: any) => {
+      remember(ctx);
+      const a = args.trim();
+      if (!a || a === "status") { ctx.ui.notify(goal ? `${goal.status} r${goal.roundsStarted}/${goal.maxGoalRounds}: ${goal.objective}` : "No goal"); return; }
+      if (a === "clear") { goal = undefined; pi.appendEntry(ENTRY.goal, undefined); ctx.ui.notify("Goal cleared"); return; }
+      if (a === "pause" && goal) { goal.status = "paused"; goal.armed = false; goal.revision++; }
+      else if (a === "resume" && goal) { goal.status = "active"; goal.armed = true; goal.revision++; }
+      else if (a !== "pause" && a !== "resume") goal = newGoal(`goal-${Date.now()}`, expandAttachments(a, ctx.cwd));
+      persistGoal(); ctx.ui.notify(`Goal: ${goal?.status} — ${goal?.objective}`);
+    },
+  });
+  // Goal round driver: continue at quiescence while armed, allowance remains, no live descendants.
+  pi.on("agent_settled", async (_e: any, ctx: any) => {
+    remember(ctx); humanTurn = false;
+    if (!goal || goal.status !== "active" || !goal.armed) return;
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    if (subagents.hasLive(owner) || jobs.hasRunning(owner)) return;
+    if (goal.roundsStarted >= goal.maxGoalRounds) {
+      goal.status = "blocked"; goal.blocker = `round-limit: reached ${goal.maxGoalRounds} rounds`; goal.armed = false; goal.revision++;
+      persistGoal(); notify("Goal reached its round limit and was blocked.", "pi-dsh/goal"); return;
+    }
+    if (pendingGoalRound !== undefined) return;
+    pendingGoalRound = goal.roundsStarted + 1;
+    pi.sendUserMessage(renderGoalRound(goal, pendingGoalRound));
+  });
+
+  // ---- PTC run_code ----
+  const toolText = (outcome: any): string => (outcome?.result?.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+  const buildBindings = (ctx: any, signal: AbortSignal | undefined, capturedImages?: any[]): PtcBindings => {
+    const tools: Record<string, (args: any) => Promise<any>> = {};
+    const scheduler = new Semaphore(Math.max(1, config.maxParallelSubCalls));
+    for (const t of (ctx.tools ?? [])) {
+      if (t.name === "run_code" || t.name === "codemode") continue;
+      tools[t.name] = (args: any) => scheduler.run(async () => {
+        const outcome = await ctx.executeTool(t.name, args ?? {}, { signal });
+        // Surface image results after the outer run_code result (dsh PTC behaviour).
+        const images = (outcome.result?.content ?? []).filter((c: any) => c.type === "image");
+        if (capturedImages && images.length > 0 && !outcome.isError) capturedImages.push(...images);
+        if (outcome.isError) throw new Error(toolText(outcome) || `tool ${t.name} failed`);
+        const textOut = toolText(outcome);
+        return outcome.result?.structuredContent ?? (images.length > 0 ? `${textOut}\n[${images.length} image(s) returned; attached after the program result]` : textOut);
+      });
+    }
+    return { tools };
+  };
+  const renderPtc = (name: string, r: { value?: unknown; logs: string[]; error?: { kind: string; message: string } }) => {
+    const logs = r.logs.join("\n");
+    if (r.error) return errText(`Error: code run failed (${r.error.kind}): ${r.error.message}${logs ? `\nCaptured output:\n${logs}` : ""}`);
+    const value = r.value === null || r.value === undefined ? "" : JSON.stringify(r.value, null, 2);
+    const out = [logs, value ? `Return value: ${value}` : ""].filter(Boolean).join("\n");
+    return text(out || `(${name} completed with no output)`);
+  };
+  pi.registerTool({
+    name: "run_code", label: "Run code (PTC)", exposure: "model-only",
+    description: "Run a program as an async function body (node, erasable TypeScript), Python statements that assign result (python), or sandboxed JS (mossbed). Call tools as await tools.<name>(args) (python: tools.<name>(args_dict)); nested calls run through the full tool pipeline (max 10 parallel) and resolve to structured content when declared, else text. Image results attach after the program result. A wider sandbox_permissions than the standing mode needs justification and user approval. Default timeout 120000ms, max 600000ms.",
+    promptSnippet: "Run code that calls tools programmatically",
+    reachesTools: () => "all" as const,
+    parameters: Type.Object({
+      code: Type.String(), description: Type.String(),
+      timeout_ms: Type.Optional(Type.Number()),
+      backend: Type.Optional(Type.Union([Type.Literal("node"), Type.Literal("mossbed"), Type.Literal("python")])),
+      sandbox_permissions: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write"), Type.Literal("danger-full-access")])),
+      justification: Type.Optional(Type.String()),
+    }),
+    prepareLoadout: (loadout: any) => {
+      const sdk = generateSdk(loadout.callable.filter((t: any) => t.name !== "run_code").map((t: any) => ({ name: t.name, description: t.description, parameters: t.parameters, outputSchema: t.outputSchema })));
+      const self = loadout.declared.find((t: any) => t.name === "run_code");
+      const descriptions = self ? { run_code: `${self.description}\n\nSDK bindings for this program (not directly callable tools):\n${sdk}` } : undefined;
+      // Like codemode "only": hide direct tools (still callable via tools.*),
+      // but keep model-only orchestrators (subagent, workflow, goals) declared.
+      return config.ptcOnly
+        ? { descriptions, hiddenDeclarations: loadout.declared.filter((t: any) => t.name !== "run_code" && loadout.getExposure(t.name) === "direct").map((t: any) => t.name) }
+        : { descriptions };
+    },
+    async execute(_id: string, p: any, signal: AbortSignal | undefined, _u: unknown, ctx: any) {
+      remember(ctx);
+      const sb = await resolveSandbox(ctx, p.sandbox_permissions, p.justification);
+      if ("error" in sb) return errText(`Error: ${sb.error}`);
+      const capturedImages: any[] = [];
+      const bindings = buildBindings(ctx, signal, capturedImages);
+      let rendered;
+      if (p.backend === "mossbed") rendered = renderPtc("run_code", await mossbed.run({ program: p.code, bindings, cwd: ctx.cwd, timeoutMs: p.timeout_ms, signal }));
+      else if (p.backend === "python") rendered = renderPtc("run_code", await pythonPtc.run({ program: p.code, bindings, cwd: ctx.cwd, timeoutMs: p.timeout_ms, signal }));
+      else rendered = renderPtc("run_code", await nodePtc.run({
+        program: await stripTypes(p.code), bindings, cwd: ctx.cwd,
+        timeoutMs: p.timeout_ms, signal, stateOwner: config.persistentPtc ? owner : undefined, sandboxMode: sb.mode,
+      }));
+      if (capturedImages.length > 0) {
+        rendered = { ...rendered, content: [...(rendered.content ?? []), ...capturedImages.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))] };
+      }
+      return rendered;
+    },
+  });
+
+  // ---- Workflow ----
+  pi.registerTool({
+    name: "workflow", label: "Workflow", exposure: "model-only",
+    description: "Run a JavaScript orchestration script that fans work out across many subagents and returns a final JSON value. Use ONLY when the user explicitly asks for a workflow or large multi-agent orchestration; for one or two delegations prefer subagent. Script hooks: agent(prompt, opts?), parallel(thunks), pipeline(items, ...stages), phase(title), log(msg); meta and args are globals. Child failures resolve agent() to null; partial output is never reported as success.",
+    promptGuidelines: ["Use the workflow tool ONLY when the user explicitly asks for a workflow or for large multi-agent orchestration. For one or two delegations, prefer plain subagent calls."],
+    reachesTools: () => "all" as const,
+    parameters: Type.Object({
+      meta: Type.Object({ name: Type.String(), description: Type.String() }),
+      script: Type.String(), args: Type.Optional(Type.Any()),
+      run_in_background: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id: string, p: any, signal: AbortSignal | undefined, _u: unknown, ctx: any) {
+      remember(ctx);
+      const runWorkflow = async (jobSignal: AbortSignal, logLine: (s: string) => void) => {
+        let started = 0;
+        const wf: Record<string, (a: any) => Promise<any>> = {
+          agent: async (a: any) => {
+            if (++started > 1000) throw new Error("workflow agent cap (1000) reached");
+            const o = typeof a === "object" && a !== null ? a : { task: String(a) };
+            const childId = await subagents.start({
+              provider: "spawn", label: o.label ?? p.meta.name, task: o.task ?? o.prompt ?? "",
+              owner, cwd: ctx.cwd, model: ctx.model, delivery: "caller",
+              outputSchema: o.schema, requireStructured: o.requireStructured === true || o.schema !== undefined,
+            });
+            const res = await subagents.wait(childId);
+            if (res.status !== "completed") return null;
+            return res.data ?? res.text;
+          },
+          phase: async (t: any) => { logLine(`[phase] ${String(t)}`); return null; },
+          log: async (t: any) => { logLine(String(t)); return null; },
+        };
+        const prelude = [
+          `const meta = ${JSON.stringify(p.meta)}; const args = ${JSON.stringify(p.args ?? {})};`,
+          "const agent = (a, o) => _wf.agent(typeof a === 'string' ? { task: a, ...(o ?? {}) } : a);",
+          "const phase = (t) => _wf.phase(t); const log = (t) => _wf.log(t);",
+          "const parallel = async (thunks) => Promise.all(thunks.map((t) => Promise.resolve().then(t).catch(() => null)));",
+          "const pipeline = async (items, ...stages) => { let cur = items; for (const s of stages) cur = await parallel(cur.map((it, i) => () => s(it, it, i))); return cur; };",
+        ].join("\n");
+        const r = await nodePtc.run({ program: await stripTypes(p.script), bindings: { _wf: wf }, cwd: ctx.cwd, timeoutMs: null, signal: jobSignal, prelude });
+        return { r, started };
+      };
+      if (p.run_in_background) {
+        const jobId = jobs.start({ kind: "workflow", label: p.meta.name, owner, run: async (h) => {
+          const { r } = await runWorkflow(h.signal, (s) => h.append(s + "\n"));
+          if (r.error) throw new Error(r.error.message);
+          return { result: `workflow "${p.meta.name}" completed.\nReturn value:\n${JSON.stringify(r.value, null, 2)}` };
+        } });
+        return text(`started background workflow job ${jobId}`);
+      }
+      const { r, started } = await runWorkflow(signal ?? new AbortController().signal, () => undefined);
+      if (r.error) return errText(`Error: workflow run failed: ${r.error.message}`);
+      const rendered = JSON.stringify(r.value, null, 2) ?? "null";
+      return text(`workflow "${p.meta.name}" completed (${started} agent${started === 1 ? "" : "s"}).\nReturn value:\n${rendered.length > 50_000 ? rendered.slice(0, 50_000) + "\n[... truncated ...]" : rendered}`);
+    },
+  });
+}
+
+/** Erasable TypeScript: strip types with Node's built-in stripper when available. */
+async function stripTypes(code: string): Promise<string> {
+  try {
+    const mod: any = await import("node:module");
+    if (typeof mod.stripTypeScriptTypes === "function") return mod.stripTypeScriptTypes(code);
+  } catch { /* fall through: program was plain JavaScript */ }
+  return code;
+}

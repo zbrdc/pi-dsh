@@ -1,0 +1,17 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tgz
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Logs and editor/system files
+*.log
+.DS_Store
+
+# Runtime job output written inside a workspace
+.pi-dsh/
