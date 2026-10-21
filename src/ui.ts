@@ -1,7 +1,9 @@
 /** Pure text renderers for pi-dsh widgets, status line, and /dsh dashboard.
  * Pi's extension UI offers string-array widgets and a footer status; these
  * functions produce bounded lines for them (dsh ui-goal/ui-jobs/ui-subagent
- * equivalents within what a Pi extension can draw). No Pi imports: unit-testable. */
+ * equivalents within what a Pi extension can draw). Only pi-tui's pure width
+ * helpers are imported, so everything stays unit-testable without a TUI. */
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Goal, TodoItem } from "./core.ts";
 import type { JobSnapshot } from "./jobs.ts";
 import { renderAgentLine, type CatalogEntry } from "./subagent.ts";
@@ -87,6 +89,60 @@ export function renderAgentsWidget(state: UiState, maxLines = 8): string[] | und
     for (const t of openTeam) lines.push(`○ ${t.id} [${t.status}]${t.owner ? ` @${t.owner}` : ""} ${clip(t.subject, 44)}`);
   }
   return lines.length > 0 ? capLines(lines, maxLines) : undefined;
+}
+
+export type WidgetKey = "goal" | "todo" | "jobs" | "agents";
+export const WIDGET_KEYS: readonly WidgetKey[] = ["goal", "todo", "jobs", "agents"];
+export const PANEL_KEY = "pi-dsh-panel";
+
+/** Every widget section by key; undefined when it has nothing to show. */
+export function renderWidgetSections(state: UiState): Record<WidgetKey, string[] | undefined> {
+  return {
+    goal: renderGoalWidget(state.goal),
+    todo: renderTodoWidget(state.todos),
+    jobs: renderJobsWidget(state.jobs),
+    agents: renderAgentsWidget(state),
+  };
+}
+
+const MIN_COLUMN_WIDTH = 30;
+const COLUMN_GAP = 3;
+
+/** Place sections side by side at `width` columns. Sections that cannot all
+ * fit one row wrap into evenly filled rows, down to a plain stack when narrow. */
+export function layoutColumns(sections: string[][], width: number): string[] {
+  if (sections.length === 0) return [];
+  const inner = Math.max(1, width - 2); // one column of padding each side, like Pi's string widgets
+  const fit = Math.max(1, Math.floor((inner + COLUMN_GAP) / (MIN_COLUMN_WIDTH + COLUMN_GAP)));
+  const rows = Math.ceil(sections.length / fit);
+  const perRow = Math.ceil(sections.length / rows);
+  const lines: string[] = [];
+  for (let i = 0; i < sections.length; i += perRow) lines.push(...layoutRow(sections.slice(i, i + perRow), inner));
+  return lines;
+}
+
+/** Give each column its natural width; when the row is too wide, shave the widest columns first. */
+function columnWidths(natural: number[], available: number): number[] {
+  let cap = Math.max(...natural);
+  while (cap > 1 && natural.reduce((sum, w) => sum + Math.min(w, cap), 0) > available) cap--;
+  return natural.map((w) => Math.min(w, cap));
+}
+
+function layoutRow(row: string[][], inner: number): string[] {
+  const natural = row.map((col) => Math.max(1, ...col.map(visibleWidth)));
+  const widths = columnWidths(natural, inner - COLUMN_GAP * (row.length - 1));
+  const height = Math.max(...row.map((col) => col.length));
+  const lines: string[] = [];
+  for (let y = 0; y < height; y++) {
+    const cells = row.map((col, i) => truncateToWidth(col[y] ?? "", widths[i], "…", true));
+    lines.push(` ${cells.join(" ".repeat(COLUMN_GAP))}`.trimEnd());
+  }
+  return lines;
+}
+
+/** Widget factory for Pi's TUI: re-lays the columns out at the live terminal width. */
+export function columnsWidget(sections: string[][]) {
+  return () => ({ render: (width: number) => layoutColumns(sections, width), invalidate() { /* stateless */ } });
 }
 
 /** Full dashboard text for the /dsh command (notify body, also usable headless). */

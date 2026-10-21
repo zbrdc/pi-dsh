@@ -12,6 +12,7 @@ Pi-dsh is a semantic reimplementation for Pi APIs, not a line-by-line source por
 |---|---|---|
 | Tasks | `todo_write`, `/plan`, `exit_plan_mode` | tool-todo, plan-mode |
 | Goals | `create_goal`, `get_goal`, `update_goal`, `/goal`, round driver with reviewer audit gate | goal, goal-round-driver, tool-goal |
+| Standing rules | `rules_write`, `/rules` — durable user instructions re-injected after every compaction (pi-dsh addition) | agent-instructions (closest) |
 | Guards | repeat-call reminders (3/5/8), timeout input caps on all tools, per-tool deadlines (`toolTimeoutMs`): fused signals for nested calls, top-level watchdog → `TOOL_TIMEOUT`; read-before-edit + stale-version FS policy, `read_image` | guard/*, fs-observation-policy, tool-fs |
 | Context | spill to file + locator, tool-result pruner at compaction pressure | spill-policy, compaction-tool-result-pruner |
 | Jobs | `job_output/list/kill`, owned `bash` (background promotion, bwrap sandbox + escalation approval), durable output files, completion wakes with caps | jobs, tool-jobs, tool-bash, sandbox-policy |
@@ -37,7 +38,7 @@ Tool deadlines (DSH timeout-policy): set `toolTimeoutMs` per tool (and/or `defau
 
 PTY sessions use node-pty when `@lydell/node-pty` loads (resize and TUI input work), else util-linux `script` (no resize). Durable terminals use tmux (`resize-window`, `send-keys`, `pipe-pane` transcript).
 
-UI: DSH ships web panels; a Pi extension can draw a footer status and string widgets. Pi-dsh uses those — goal, todos, jobs, and agents/terminals/team widgets refreshed on every state change — plus `/dsh` for a full dashboard. Set `uiWidgets: false` to disable.
+UI: DSH ships web panels; a Pi extension can draw a footer status and string widgets. Pi-dsh uses those — goal, todos, jobs, and agents/terminals/team shown side by side in one panel (stacking only when the terminal is too narrow), refreshed on every state change — plus `/dsh` for a full dashboard. Set `uiWidgets: false` to disable.
 
 ## Install
 

@@ -4,6 +4,8 @@ All notable changes to pi-dsh will be documented in this file.
 
 ## Unreleased
 
+- Standing rules: `rules_write` (whole-list replace, max 20 × 400 chars) and `/rules` persist durable user instructions as session entries and carry them in the control section, so they survive compaction by extractive compactors such as pi-vcc. A pi-dsh addition with no DSH tool equivalent.
+- UI: goal, todos, jobs, and agents/terminals/team now share one side-by-side panel widget in the TUI (columns sized to content, wrapping into rows on narrow terminals) instead of four stacked widgets, leaving more room for output. RPC mode keeps the stacked string widgets. Declares `@earendil-works/pi-tui` as a peer dependency.
 - Subagents in depth, modeled on DSH `dsh-subagent` + experimental agent-team:
   - Delegation depth budget (`maxSubagentDepth`, default 1): below the cap, children receive scoped `subagent`/`subagent_fork`/`send_message`/`interrupt_agent`/`list_agents` tools; direct parents receive completion steers.
   - Adjacent messaging both directions with sender framing and messageIds (child → parent/`lead`, parent → descendants, teammate → teammate); non-adjacent sends are rejected.

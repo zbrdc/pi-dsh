@@ -9,7 +9,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
 import {
   RepeatTracker, spillText, pruneText, validateTodos, generateSdk,
-  newGoal, applyBlocker, renderGoalRound, renderTaskControlSection, Semaphore, completedTurnCut,
+  newGoal, applyBlocker, renderGoalRound, renderTaskControlSection, validateRules, Semaphore, completedTurnCut,
   resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, parseOutputSchema,
   SANDBOX_ORDER, type TodoItem, type Goal, type SandboxMode,
 } from "./core.ts";
@@ -18,9 +18,9 @@ import { TerminalRegistry, PersistentBash, runShellJob } from "./terminal.ts";
 import { NodePtcProvider, MossbedProvider, PythonPtcProvider, type PtcBindings } from "./ptc.ts";
 import { SubagentManager, renderAgentLine, type CatalogEntry } from "./subagent.ts";
 import { TeamBoard, renderTeamTask, type TeamTaskAction } from "./team.ts";
-import { renderAgentsWidget, renderDashboard, renderGoalWidget, renderJobsWidget, renderStatusLine, renderTodoWidget, type UiState } from "./ui.ts";
+import { PANEL_KEY, WIDGET_KEYS, columnsWidget, renderAgentsWidget, renderDashboard, renderJobsWidget, renderStatusLine, renderTodoWidget, renderWidgetSections, type UiState } from "./ui.ts";
 
-const ENTRY = { todo: "pi-dsh/todo", plan: "pi-dsh/plan", goal: "pi-dsh/goal", catalog: "pi-dsh/catalog", team: "pi-dsh/team-tasks" };
+const ENTRY = { todo: "pi-dsh/todo", rules: "pi-dsh/rules", plan: "pi-dsh/plan", goal: "pi-dsh/goal", catalog: "pi-dsh/catalog", team: "pi-dsh/team-tasks" };
 const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
 const errText = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details, isError: true as const });
 
@@ -73,6 +73,7 @@ export default function (pi: any) {
   let lastCtx: any;
   let owner = "unknown";
   let todos: TodoItem[] = [];
+  let rules: string[] = [];
   let planActive = false;
   let goal: Goal | undefined;
   let humanTurn = false;
@@ -108,10 +109,14 @@ export default function (pi: any) {
       if (!lastCtx?.hasUI) return;
       const state = uiState();
       lastCtx.ui.setStatus("pi-dsh", renderStatusLine(state));
-      lastCtx.ui.setWidget("pi-dsh-goal", renderGoalWidget(goal));
-      lastCtx.ui.setWidget("pi-dsh-todo", renderTodoWidget(todos));
-      lastCtx.ui.setWidget("pi-dsh-jobs", renderJobsWidget(state.jobs));
-      lastCtx.ui.setWidget("pi-dsh-agents", renderAgentsWidget(state));
+      const sections = renderWidgetSections(state);
+      if (lastCtx.mode === "tui") {
+        // One side-by-side panel; component widgets exist only in the TUI.
+        const columns = WIDGET_KEYS.map((key) => sections[key]).filter((s): s is string[] => s !== undefined);
+        lastCtx.ui.setWidget(PANEL_KEY, columns.length > 0 ? columnsWidget(columns) : undefined);
+      } else {
+        for (const key of WIDGET_KEYS) lastCtx.ui.setWidget(`pi-dsh-${key}`, sections[key]);
+      }
     } catch { /* UI gone */ }
   };
   const updateGoalWidget = refreshUI;
@@ -142,18 +147,20 @@ export default function (pi: any) {
       return body.length > 8000 ? `[attached file ${path}]\n${body.slice(0, 8000)}\n[... truncated ...]` : `[attached file ${path}]\n${body}`;
     } catch { return whole; }
   });
-  const currentControlSection = () => renderTaskControlSection({ goal, todos, planActive });
+  const currentControlSection = () => renderTaskControlSection({ goal, todos, planActive, rules });
+  const hasControlState = () => Boolean(goal) || todos.some((t) => t.status !== "completed") || planActive || rules.length > 0;
   const persistGoal = () => { if (goal) pi.appendEntry(ENTRY.goal, goal); updateGoalWidget(); };
   const hashFile = async (path: string) => createHash("sha256").update(await readFile(path)).digest("hex");
   const resolvePath = (ctx: any, p: string) => (isAbsolute(p) ? p : resolve(ctx.cwd, p));
 
   function restore(ctx: any) {
     remember(ctx);
-    todos = []; planActive = false; goal = undefined; teamEntries = []; pendingGoalRound = undefined; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
+    todos = []; rules = []; planActive = false; goal = undefined; teamEntries = []; pendingGoalRound = undefined; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
     const catalog: CatalogEntry[] = [];
     for (const e of ctx.sessionManager.getBranch()) {
       if (e.type !== "custom") continue;
       if (e.customType === ENTRY.todo) todos = (e.data as TodoItem[]) ?? [];
+      if (e.customType === ENTRY.rules) rules = (e.data as string[]) ?? [];
       if (e.customType === ENTRY.plan) { planActive = Boolean((e.data as any)?.active); if (typeof (e.data as any)?.prompt === "string" && planActive) pendingPlanPrompt = (e.data as any).prompt; }
       if (e.customType === ENTRY.goal) goal = e.data as Goal;
       if (e.customType === ENTRY.team) teamEntries = (e.data as unknown[]) ?? [];
@@ -316,7 +323,7 @@ export default function (pi: any) {
     const size = JSON.stringify(e.messages).length;
     if (size < config.pruneThresholdChars) {
       const control = currentControlSection();
-      if ((goal || todos.some((t) => t.status !== "completed") || planActive) && control !== lastControlSection) {
+      if (hasControlState() && control !== lastControlSection) {
         lastControlSection = control;
         return { messages: [...e.messages, {
           role: "custom", customType: "pi-dsh/control", display: false, timestamp: Date.now(),
@@ -355,7 +362,7 @@ export default function (pi: any) {
       messages.push({ ...m, content });
     }
     const control = currentControlSection();
-    if ((goal || todos.some((t) => t.status !== "completed") || planActive) && control !== lastControlSection) {
+    if (hasControlState() && control !== lastControlSection) {
       lastControlSection = control;
       messages.push({
         role: "custom", customType: "pi-dsh/control", display: false, timestamp: Date.now(),
@@ -382,6 +389,21 @@ export default function (pi: any) {
       refreshUI();
       const n = (s: string) => todos.filter((t) => t.status === s).length;
       return text(`Updated todo list: ${n("pending")} pending, ${n("in_progress")} in progress, ${n("completed")} completed.`);
+    },
+  });
+
+  // ---- Standing rules (pi-dsh addition; DSH carries these in AGENTS.md and its LLM checkpoint) ----
+  pi.registerTool({
+    name: "rules_write", label: "Rules write",
+    description: "Record durable user instructions (preferences, constraints, prohibitions) that must outlive this turn and any context summary. Send the COMPLETE list on every update; it replaces the previous list. Remove a rule once the user lifts it. Not for task steps (use todo_write) or the objective (use create_goal).",
+    promptSnippet: "Replace the standing rules list",
+    parameters: Type.Object({ rules: Type.Array(Type.String()) }),
+    async execute(_id: string, params: any, _sig: unknown, _upd: unknown, ctx: any) {
+      remember(ctx);
+      try { rules = validateRules(params.rules); }
+      catch (e) { return errText(`Error: ${e instanceof Error ? e.message : String(e)}`); }
+      pi.appendEntry(ENTRY.rules, rules);
+      return text(`Updated standing rules: ${rules.length} active.`);
     },
   });
 
@@ -1054,6 +1076,14 @@ export default function (pi: any) {
   pi.registerCommand("dsh", {
     description: "Show the pi-dsh dashboard (goal, todos, jobs, agents, terminals)",
     handler: async (_args: string, ctx: any) => { remember(ctx); refreshUI(); safeNotify(ctx, renderDashboard(uiState())); },
+  });
+  pi.registerCommand("rules", {
+    description: "Show the standing rules (/rules clear to drop them all)",
+    handler: async (args: string, ctx: any) => {
+      remember(ctx);
+      if (args.trim() === "clear") { rules = []; pi.appendEntry(ENTRY.rules, rules); safeNotify(ctx, "Standing rules cleared."); return; }
+      safeNotify(ctx, rules.length > 0 ? ["Standing rules:", ...rules.map((r) => `- ${r}`)].join("\n") : "No standing rules.");
+    },
   });
   pi.registerCommand("todos", {
     description: "Show the current todo list",

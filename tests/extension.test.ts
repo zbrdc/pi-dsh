@@ -100,16 +100,66 @@ test("widgets + status refresh across todo, goal, and background job", async () 
   await h.emit("input", { type: "input", text: "work", source: "interactive" });
   await h.tools.get("create_goal").execute("1", { objective: "Widget goal" }, undefined, undefined, h.ctx);
   await h.tools.get("todo_write").execute("2", { todos: [{ content: "Widget todo", status: "in_progress" }] }, undefined, undefined, h.ctx);
-  assert.match(h.widgets.get("pi-dsh-goal").join("\n"), /Widget goal/);
-  assert.match(h.widgets.get("pi-dsh-todo").join("\n"), /Widget todo/);
+  const panel = () => h.widgets.get("pi-dsh-panel")().render(120).join("\n");
+  assert.match(panel(), /Widget goal/);
+  assert.match(panel(), /Widget todo/);
   assert.match(h.statuses.get("pi-dsh"), /goal active/);
   const started = await h.tools.get("bash").execute("3", { command: "sleep 30", run_in_background: true }, undefined, undefined, h.ctx);
   assert.match(started.content[0].text, /background job/);
-  assert.match(h.widgets.get("pi-dsh-jobs").join("\n"), /Jobs \(1 running\)/);
+  assert.match(panel(), /Jobs \(1 running\)/);
+  const goalRow = h.widgets.get("pi-dsh-panel")().render(120).find((l: string) => l.includes("Widget goal"));
+  assert.match(goalRow, /Todos/);
+  assert.match(goalRow, /Jobs/);
   const jobId = started.content[0].text.match(/job (\S+)/)[1];
   await h.tools.get("job_kill").execute("4", { job_id: jobId }, undefined, undefined, h.ctx);
-  assert.match(h.widgets.get("pi-dsh-jobs").join("\n"), /Jobs \(0 running\)/);
+  assert.match(panel(), /Jobs \(0 running\)/);
+  assert.equal(h.widgets.has("pi-dsh-goal"), false);
   await h.emit("session_shutdown", { type: "session_shutdown" });
+});
+
+test("widgets fall back to stacked string arrays outside the TUI", async () => {
+  const h = makeHarness("rpc", true);
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  await h.emit("input", { type: "input", text: "work", source: "interactive" });
+  await h.tools.get("create_goal").execute("1", { objective: "Widget goal" }, undefined, undefined, h.ctx);
+  await h.tools.get("todo_write").execute("2", { todos: [{ content: "Widget todo", status: "in_progress" }] }, undefined, undefined, h.ctx);
+  assert.match(h.widgets.get("pi-dsh-goal").join("\n"), /Widget goal/);
+  assert.match(h.widgets.get("pi-dsh-todo").join("\n"), /Widget todo/);
+  assert.equal(h.widgets.get("pi-dsh-jobs"), undefined);
+  assert.equal(h.widgets.has("pi-dsh-panel"), false);
+  await h.emit("session_shutdown", { type: "session_shutdown" });
+});
+
+test("standing rules persist, reach the model without a goal, and survive compaction and restore", async () => {
+  const h = makeHarness("tui", true);
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  const bad = await h.tools.get("rules_write").execute("1", { rules: ["ok", "  "] }, undefined, undefined, h.ctx);
+  assert.equal(bad.isError, true);
+  assert.deepEqual(h.entries.filter(([name]) => name === "pi-dsh/rules"), []);
+
+  const ok = await h.tools.get("rules_write").execute("2", { rules: ["Never run reviewer children during a measurement window."] }, undefined, undefined, h.ctx);
+  assert.match(ok.content[0].text, /1 active/);
+  assert.deepEqual(h.entries.filter(([name]) => name === "pi-dsh/rules").at(-1)?.[1], ["Never run reviewer children during a measurement window."]);
+
+  const inject = () => h.emit("context", { type: "context", messages: [{ role: "user", content: "go", timestamp: 1 }] });
+  const first = await inject();
+  assert.equal(first.messages.at(-1).customType, "pi-dsh/control");
+  assert.match(first.messages.at(-1).content[0].text, /Never run reviewer children/);
+  assert.equal(await inject(), undefined, "unchanged control section is not repeated");
+  await h.emit("session_compact", { type: "session_compact" });
+  assert.match((await inject()).messages.at(-1).content[0].text, /Never run reviewer children/);
+
+  // A fresh session restores the list from the branch entries.
+  const restored = makeHarness("tui", true);
+  restored.ctx.sessionManager.getBranch = () => [{ type: "custom", customType: "pi-dsh/rules", data: ["Commit every green slice."] }];
+  await restored.emit("session_start", { type: "session_start", reason: "resume" });
+  const control = await restored.emit("context", { type: "context", messages: [{ role: "user", content: "go", timestamp: 1 }] });
+  assert.match(control.messages.at(-1).content[0].text, /Commit every green slice/);
+
+  await h.commands.get("rules").handler("clear", h.ctx);
+  assert.deepEqual(h.entries.filter(([name]) => name === "pi-dsh/rules").at(-1)?.[1], []);
+  await h.emit("session_shutdown", { type: "session_shutdown" });
+  await restored.emit("session_shutdown", { type: "session_shutdown" });
 });
 
 test("/plan <task> in print mode: no UI calls, task delivered at before_agent_start", async () => {

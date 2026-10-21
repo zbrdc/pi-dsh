@@ -24,6 +24,24 @@ export function validateTodos(raw: unknown, allowParallel: boolean): TodoItem[] 
   return out;
 }
 
+export const MAX_RULES = 20;
+export const MAX_RULE_CHARS = 400;
+
+/** Validate a whole-list standing-rules replacement: trimmed, deduplicated, bounded. */
+export function validateRules(raw: unknown): string[] {
+  if (!Array.isArray(raw)) throw new Error("rules must be an array of strings");
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") throw new Error("each rule must be a string");
+    const rule = item.trim();
+    if (!rule) throw new Error("rule must not be empty");
+    if (rule.length > MAX_RULE_CHARS) throw new Error(`rule exceeds ${MAX_RULE_CHARS} characters: ${rule.slice(0, 60)}…`);
+    if (!out.includes(rule)) out.push(rule);
+  }
+  if (out.length > MAX_RULES) throw new Error(`at most ${MAX_RULES} standing rules; merge or drop some`);
+  return out;
+}
+
 /** Canonical JSON for repeat detection: stable key order. */
 export function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
@@ -196,7 +214,7 @@ export function captureStructuredSubmission(params: any): unknown {
 /** Standing DSH-style operating guidance plus a bounded snapshot of live task
  * controls. Completed todos are not repeated; long objectives are bounded. */
 export function renderTaskControlSection(state: {
-  goal?: Goal; todos: TodoItem[]; planActive: boolean;
+  goal?: Goal; todos: TodoItem[]; planActive: boolean; rules?: string[];
 }): string {
   const liveTodos = state.todos.filter((t) => t.status !== "completed").slice(0, 20);
   const objective = state.goal && state.goal.objective.length > 1000
@@ -209,7 +227,12 @@ export function renderTaskControlSection(state: {
     "Check the [exit code: N] marker on every bash result; investigate failures before moving on and change approach after an identical failure.",
     "Track every background job and subagent id. Do not busy-poll or duplicate its work; before finishing, collect still-relevant jobs and account for delegated results.",
     "For goals, mark complete only when the whole objective is actually achieved and evidenced. Difficulty, uncertainty, or useful remaining work is not blocked.",
+    "When the user or a coordinator states a durable instruction (a preference, constraint, or prohibition meant to outlive this turn), record it with rules_write and drop it once it is lifted. Summaries of earlier history can lose it; this list is not summarized.",
   ];
+  if (state.rules && state.rules.length > 0) {
+    lines.push("Standing rules (obey until the user lifts them):");
+    for (const rule of state.rules) lines.push(`- ${rule}`);
+  }
   if (state.planActive) lines.push("Plan mode is active: research and plan only; do not implement or mutate files until the plan is approved.");
   if (state.goal) {
     lines.push(`Current goal (${state.goal.id}, revision ${state.goal.revision}, ${state.goal.status}, rounds ${state.goal.roundsStarted}/${state.goal.maxGoalRounds}, armed=${state.goal.armed}): ${objective}`);

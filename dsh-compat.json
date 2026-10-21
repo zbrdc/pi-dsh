@@ -45,6 +45,20 @@
       ]
     },
     {
+      "area": "Standing rules",
+      "status": "partial",
+      "dshPackages": [
+        "packages/context/agent-instructions"
+      ],
+      "piTools": [
+        "rules_write"
+      ],
+      "piCommands": [
+        "rules"
+      ],
+      "notes": "A pi-dsh addition. DSH keeps durable user instructions in AGENTS.md (agent-instructions) and in its LLM-written checkpoint ('Critical Context'). pi-vcc compacts algorithmically and can drop a rule list, so rules_write stores them as session entries and re-injects them in the control section after every compaction."
+    },
+    {
       "area": "Guards",
       "status": "ported",
       "dshPackages": [

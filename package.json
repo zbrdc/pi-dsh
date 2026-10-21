@@ -49,6 +49,7 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "optionalDependencies": {
@@ -56,6 +57,7 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "@types/node": "^24",
     "typebox": "*",
     "typescript": "^5"

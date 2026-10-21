@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs, resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, tmuxSessionName, tmuxSendKeysChunks, parseOutputSchema } from "../src/core.ts";
+import { validateRules, MAX_RULES, MAX_RULE_CHARS, validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs, resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, tmuxSessionName, tmuxSendKeysChunks, parseOutputSchema } from "../src/core.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { JobRegistry } from "../src/jobs.ts";
-import { capLines, renderAgentsWidget, renderDashboard, renderJobsWidget, renderStatusLine, renderTodoWidget } from "../src/ui.ts";
+import { capLines, layoutColumns, renderAgentsWidget, renderDashboard, renderJobsWidget, renderStatusLine, renderTodoWidget } from "../src/ui.ts";
 import { TerminalRegistry, tmuxAvailable } from "../src/terminal.ts";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -266,6 +267,47 @@ test("ui widgets render bounded goal/todo/jobs/agents state", () => {
   assert.deepEqual(capLines(["a", "b", "c", "d"], 3), ["a", "b", "… +2 more"]);
   assert.equal(renderTodoWidget([]), undefined);
   assert.equal(renderJobsWidget([]), undefined);
+});
+
+test("layoutColumns places sections side by side and stacks when narrow", () => {
+  const sections = [["G1", "G2"], ["T1"], ["J1", "J2", "J3"]];
+  const wide = layoutColumns(sections, 120);
+  assert.equal(wide.length, 3);
+  assert.match(wide[0], /G1 +T1 +J1/);
+  assert.match(wide[2], /^ {2,}J3$/);
+  assert.ok(wide.every((l) => l.length <= 120));
+  const narrow = layoutColumns(sections, 40);
+  assert.deepEqual(narrow.map((l) => l.trim()), ["G1", "G2", "T1", "J1", "J2", "J3"]);
+  const four = layoutColumns([["a"], ["b"], ["c"], ["d"]], 100);
+  assert.deepEqual(four.map((l) => l.trim().split(/ +/)), [["a", "b"], ["c", "d"]]);
+  assert.deepEqual(layoutColumns([], 80), []);
+});
+
+test("layoutColumns truncates cells to the column width, wide characters included", () => {
+  const lines = layoutColumns([["🤖 " + "x".repeat(80)], ["y".repeat(80)]], 70);
+  assert.equal(lines.length, 1);
+  assert.ok(visibleWidth(lines[0]) <= 70);
+  assert.match(lines[0], /…/);
+  const short = layoutColumns([["x".repeat(20)], ["y".repeat(20)], ["z".repeat(90)]], 100);
+  assert.ok(short[0].includes("x".repeat(20)) && short[0].includes("y".repeat(20)), "short columns keep full width");
+  assert.ok(visibleWidth(short[0]) <= 100);
+});
+
+test("validateRules trims, deduplicates, and bounds the standing-rules list", () => {
+  assert.deepEqual(validateRules(["  Never push to main ", "Never push to main", "Use tabs"]), ["Never push to main", "Use tabs"]);
+  assert.deepEqual(validateRules([]), []);
+  assert.throws(() => validateRules("rule"), /array/);
+  assert.throws(() => validateRules([42]), /string/);
+  assert.throws(() => validateRules(["ok", "   "]), /empty/);
+  assert.throws(() => validateRules(["x".repeat(MAX_RULE_CHARS + 1)]), /exceeds/);
+  assert.throws(() => validateRules(Array.from({ length: MAX_RULES + 1 }, (_, i) => `rule ${i}`)), /at most/);
+});
+
+test("control section carries standing rules and the instruction to record them", () => {
+  const withRules = renderTaskControlSection({ todos: [], planActive: false, rules: ["Never run reviewers during a window", "Commit every green slice"] });
+  assert.match(withRules, /Standing rules \(obey until the user lifts them\):\n- Never run reviewers during a window\n- Commit every green slice/);
+  assert.match(withRules, /rules_write/);
+  assert.doesNotMatch(renderTaskControlSection({ todos: [], planActive: false }), /Standing rules/);
 });
 
 test("terminal restore: dead session becomes readable exited stub", () => {
