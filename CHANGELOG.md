@@ -2,7 +2,7 @@
 
 All notable changes to pi-dsh will be documented in this file.
 
-## Unreleased
+## 0.3.0 - 2026-10-21
 
 - Goal driver: rounds are admitted at Pi's `agent_before_settle` boundary as a continuation of the running run, replacing the settled-time synthetic user message. Escape now stops the loop (an aborted round pauses the goal; an aborted human turn disarms it), `/goal pause` aborts the live turn, an errored run disarms the goal, and a round that never starts blocks it instead of staying half-counted. Human authority no longer carries from the starting prompt into later rounds.
 - Subagents: children honor the standing `sandboxMode` (a confined foreground `bash` under `read-only`/`workspace-write`, fail-closed like the parent's); previously `read-only` did not constrain children. `structured_output` ends a child run with `terminate: true` instead of a 200 ms poll plus abort; a mixed tool batch closes at the turn boundary.
