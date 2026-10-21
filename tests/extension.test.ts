@@ -224,3 +224,17 @@ test("subagent v2 surface: model/preset/schema params, status and model tools, C
   assert.equal(badModel.isError, true);
   assert.match(badModel.content[0].text, /unknown subagent model route/);
 });
+
+test("delegation tools expose worktree isolation and pass it through to the manager", async () => {
+  const h = makeHarness("tui", true);
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  for (const name of ["subagent", "subagent_fork", "spawn_teammate"]) {
+    assert.ok(JSON.stringify(h.tools.get(name).parameters).includes('"isolation"'), name);
+  }
+  // /tmp is not a git repository, so a request that reaches the manager is refused with the isolation error.
+  for (const [name, args] of [["subagent", { task: "x" }], ["spawn_teammate", { name: "iso", task: "x" }]] as const) {
+    const res = await h.tools.get(name).execute("1", { ...args, isolation: "worktree" }, undefined, undefined, h.ctx);
+    assert.equal(res.isError, true, name);
+    assert.match(res.content[0].text, /needs a git repository/, name);
+  }
+});

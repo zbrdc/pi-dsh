@@ -12,6 +12,8 @@ export interface TerminalRow { id: string; label: string; alive: boolean; backen
 export interface TeamTaskRow { id: string; subject: string; status: string; owner?: string }
 export interface UiState {
   goal?: Goal; todos: TodoItem[]; planActive: boolean;
+  /** Notices waiting for the model (see outbox.ts). */
+  inbox?: number;
   jobs: JobSnapshot[]; agents: CatalogEntry[]; terminals: TerminalRow[]; teamTasks: TeamTaskRow[];
 }
 
@@ -40,6 +42,7 @@ export function renderStatusLine(state: UiState): string {
   if (live > 0) parts.push(`${live} agent${live === 1 ? "" : "s"}`);
   const terms = state.terminals.filter((t) => t.alive).length;
   if (terms > 0) parts.push(`${terms} term${terms === 1 ? "" : "s"}`);
+  if (state.inbox) parts.push(`${state.inbox} notice${state.inbox === 1 ? "" : "s"}`);
   return parts.join(" · ");
 }
 

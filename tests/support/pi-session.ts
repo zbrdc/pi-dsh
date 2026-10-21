@@ -4,7 +4,7 @@
  *
  * Importing this module redirects HOME to a scratch directory; node --test runs
  * each test file in its own process, so the override never leaks. */
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -29,13 +29,22 @@ export async function createFauxModelRuntime() {
   return { faux, modelRuntime };
 }
 
-export interface HarnessOptions { cwd?: string }
+export interface HarnessOptions {
+  cwd?: string;
+  /** Contents of pi-dsh.json for this session; absent means defaults. */
+  config?: Record<string, unknown>;
+  /** Session entries carried over from an earlier session, to model a restart. */
+  entries?: any[];
+}
 
 /** Session with the pi-dsh extension loaded and no other resources. */
 export async function createHarness(options: HarnessOptions = {}) {
   const { faux, modelRuntime } = await createFauxModelRuntime();
   const cwd = options.cwd ?? mkdtempSync(join(home, "ws-"));
   const agentDir = join(home, ".pi", "agent");
+  const configPath = join(agentDir, "pi-dsh.json");
+  if (options.config) writeFileSync(configPath, JSON.stringify(options.config));
+  else rmSync(configPath, { force: true });
   const loader = new sdk.DefaultResourceLoader({
     cwd, agentDir, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
     extensionFactories: [piDsh as any],
@@ -43,9 +52,11 @@ export async function createHarness(options: HarnessOptions = {}) {
   await loader.reload();
   const { session } = await sdk.createAgentSession({
     cwd, agentDir, model: faux.getModel(), thinkingLevel: "off", modelRuntime,
-    resourceLoader: loader, sessionManager: sdk.SessionManager.inMemory(cwd),
+    resourceLoader: loader, sessionManager: sdk.SessionManager.inMemory(cwd, undefined, options.entries),
     settingsManager: sdk.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
   });
+  // Every Pi host binds extensions after creating the session; that is what emits session_start.
+  await session.bindExtensions({});
   const events: any[] = [];
   session.subscribe((event: any) => { events.push(event); });
   const goalEntries = () => session.sessionManager.getBranch()
@@ -53,8 +64,26 @@ export async function createHarness(options: HarnessOptions = {}) {
     .map((e: any) => e.data);
   return {
     session, faux, cwd, events,
+    /** Entries to hand to a later harness as `entries`. */
+    entries: () => [session.sessionManager.getHeader(), ...session.sessionManager.getEntries()],
+    /** Display text of every custom message of this type in the model's context. */
+    customMessages: (type: string) => session.sessionManager.getBranch()
+      .filter((e: any) => e.type === "custom_message" && e.customType === type)
+      .map((e: any) => (typeof e.content === "string" ? e.content : JSON.stringify(e.content))),
     /** The latest persisted goal state, or undefined when none exists. */
     goal: () => goalEntries().at(-1) as any,
+    /** The latest persisted outbox snapshot: notices waiting for the model. */
+    outbox: () => ((session.sessionManager.getBranch() as any[])
+      .filter((e) => e.type === "custom" && e.customType === "pi-dsh/outbox")
+      .at(-1)?.data ?? []) as any[],
+    /** Resolve once `predicate` holds. */
+    async until(predicate: () => boolean, timeoutMs = 5000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!predicate()) {
+        if (Date.now() > deadline) throw new Error("condition not met in time");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    },
     /** Resolve once the faux provider has served `count` requests. */
     async waitForCalls(count: number, timeoutMs = 5000) {
       const deadline = Date.now() + timeoutMs;

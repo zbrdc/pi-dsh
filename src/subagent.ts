@@ -13,6 +13,7 @@ import { Type } from "typebox";
 import { RepeatTracker, captureStructuredSubmission, completedTurnCut, normalizeStructured, pruneText, spillText, timeoutFieldCaps } from "./core.ts";
 import { renderTeamTask, type TeamBoard, type TeamTaskAction } from "./team.ts";
 import { createSandboxedBash, isRestrictive, type ChildSandbox } from "./child-bash.ts";
+import { createWorktree, ensureWorktree, removeWorktree, settleWorktree, worktreeCwd, type Worktree } from "./worktree.ts";
 
 export type StopReason = "completed" | "failed" | "killed" | "timeout" | "interrupted" | "host-exit";
 export interface ActivationResult { childId: string; text: string; data?: unknown; status: "completed" | "failed" | "killed"; stopReason?: StopReason }
@@ -30,6 +31,8 @@ export interface CatalogEntry {
   lastStatus?: ActivationResult["status"]; stopReason?: StopReason;
   resultText?: string; resultData?: unknown;
   progress?: string; toolCalls: number; turns: number;
+  /** Set when the child runs in its own git worktree (see worktree.ts). */
+  worktree?: Worktree;
 }
 export interface ActivityEvent { at: number; kind: string; text: string }
 export interface AgentStatus {
@@ -71,6 +74,8 @@ export interface StartOptions {
   outputSchema?: Record<string, unknown>;
   delivery: "parent" | "caller"; tools?: string[]; systemAppend?: string;
   timeoutMs?: number; signal?: AbortSignal;
+  /** "worktree" gives the child its own checkout and branch of the repository containing `cwd`. */
+  isolation?: "worktree";
 }
 
 interface Activation {
@@ -99,6 +104,8 @@ export class SubagentManager {
     createChild?: CreateChildFn; board?: TeamBoard;
     /** Standing sandbox for children (parent sandboxMode + runner). */
     sandbox?: ChildSandbox;
+    /** Where isolated children's worktrees live (default under ~/.pi/agent/pi-dsh/worktrees). */
+    worktreeRoot?: string;
     /** Resolve a persisted model route label back to a live model (cold resume). */
     resolveModel?: (label: string) => unknown;
   };
@@ -214,36 +221,45 @@ export class SubagentManager {
     if (this.liveCount(opts.owner) >= this.maxActive) throw new Error(`ACTIVATION_LIMIT_REACHED: ${this.maxActive} live subagents in this tree; wait for one to finish`);
     if (opts.signal?.aborted) throw new Error("subagent start aborted");
     const builtinTools = (opts.tools ?? DEFAULT_TOOLS).filter((t) => CHILD_BUILTIN_TOOLS.has(t));
+    const worktree = opts.isolation === "worktree" ? await createWorktree(opts.cwd, opts.label, this.opts.worktreeRoot) : undefined;
+    const cwd = worktree ? worktreeCwd(worktree) : opts.cwd;
+    const systemAppend = [opts.systemAppend, worktree && isolationNote(worktree)].filter(Boolean).join("\n\n") || undefined;
     const identity = { childId: "" };
     const pending: PendingChild = {
       owner: opts.owner, parentId, depth, role: opts.role ?? "child", name: opts.name,
-      label: opts.label, cwd: opts.cwd, model: opts.model, modelLabel: opts.modelLabel,
+      label: opts.label, cwd, model: opts.model, modelLabel: opts.modelLabel,
       thinkingLevel: opts.thinkingLevel, preset: opts.preset,
     };
     const extraTools = this.buildChildTools(identity, pending);
     const toolNames = [...new Set([...builtinTools, "structured_output", ...extraTools.map((t) => t.name)])];
-    const handle = await this.createChild()({
-      cwd: opts.cwd, model: opts.model, thinkingLevel: opts.thinkingLevel, tools: toolNames,
-      systemAppend: opts.systemAppend, childDir: this.childDir(),
-      seedMessages: opts.provider === "fork" ? opts.seedMessages : undefined,
-      requireStructured: opts.requireStructured === true || opts.outputSchema !== undefined,
-      outputSchema: opts.outputSchema, extraTools, sandbox: this.opts.sandbox,
-      prompt: { name: opts.name, role: pending.role, depth, maxDepth: this.maxDepth, teamPolicy: pending.role === "teammate" },
-    });
+    let handle: ChildHandle;
+    try {
+      handle = await this.createChild()({
+        cwd, model: opts.model, thinkingLevel: opts.thinkingLevel, tools: toolNames,
+        systemAppend, childDir: this.childDir(),
+        seedMessages: opts.provider === "fork" ? opts.seedMessages : undefined,
+        requireStructured: opts.requireStructured === true || opts.outputSchema !== undefined,
+        outputSchema: opts.outputSchema, extraTools, sandbox: this.opts.sandbox,
+        prompt: { name: opts.name, role: pending.role, depth, maxDepth: this.maxDepth, teamPolicy: pending.role === "teammate" },
+      });
+    } catch (err) {
+      if (worktree) await removeWorktree(worktree).catch(() => undefined);
+      throw err;
+    }
     identity.childId = handle.sessionId;
     const entry: CatalogEntry = {
       childId: handle.sessionId, provider: opts.provider, label: opts.label, owner: opts.owner,
       parentId, depth, role: pending.role, name: opts.name,
-      sessionFile: handle.sessionFile, cwd: opts.cwd, createdAt: Date.now(), status: "live", continuable: true,
+      sessionFile: handle.sessionFile, cwd, createdAt: Date.now(), status: "live", continuable: true,
       modelLabel: opts.modelLabel, thinkingLevel: opts.thinkingLevel, preset: opts.preset, tools: toolNames,
-      toolCalls: 0, turns: 0,
+      toolCalls: 0, turns: 0, ...(worktree ? { worktree } : {}),
     };
     let resolveResult: (r: ActivationResult) => void = () => undefined;
     const result = new Promise<ActivationResult>((resolve) => { resolveResult = resolve; });
     const activation: Activation = {
       entry, handle, result, resolveResult, inputClosed: false, settled: false,
       requireStructured: opts.requireStructured === true || opts.outputSchema !== undefined,
-      outputSchema: opts.outputSchema, systemAppend: opts.systemAppend, model: opts.model,
+      outputSchema: opts.outputSchema, systemAppend, model: opts.model,
       activity: [], interruptRequested: false, timedOut: false, delivery: opts.delivery,
     };
     this.activations.set(entry.childId, activation);
@@ -287,9 +303,12 @@ export class SubagentManager {
     const stopReason: StopReason = a.timedOut ? "timeout" : a.interruptRequested ? "interrupted" : status;
     if (a.timedOut || a.interruptRequested) status = "killed";
     const textBody = handle.lastText() || (data !== undefined ? JSON.stringify(data) : "");
+    // The worktree note leads so it survives the truncation applied to long answers.
+    const worktreeNote = a.entry.worktree ? await settleWorktree(a.entry.worktree) : "";
+    const answer = a.timedOut ? `${textBody}\n[subagent timed out after ${timeoutMs}ms]`.trim() : textBody;
     const result: ActivationResult = {
       childId: a.entry.childId, status, stopReason, data,
-      text: a.timedOut ? `${textBody}\n[subagent timed out after ${timeoutMs}ms]`.trim() : textBody,
+      text: worktreeNote ? `${worktreeNote}\n\n${answer}`.trim() : answer,
     };
     a.entry.status = "settled";
     a.entry.settledAt = Date.now();
@@ -385,6 +404,7 @@ export class SubagentManager {
     // Cold resume from the persisted child session file (descriptor reapplies).
     if (!a.entry.sessionFile) throw new Error(`message not delivered: subagent ${targetEntry.childId} is NOT_RESUMABLE (no persisted session)`);
     if (this.liveCount(a.entry.owner) >= this.maxActive) throw new Error(`ACTIVATION_LIMIT_REACHED: ${this.maxActive} live subagents in this tree; wait for one to finish`);
+    if (a.entry.worktree) await ensureWorktree(a.entry.worktree);
     const identity = { childId: a.entry.childId };
     const pending: PendingChild = {
       owner: a.entry.owner, parentId: a.entry.parentId, depth: a.entry.depth, role: a.entry.role, name: a.entry.name,
@@ -549,6 +569,10 @@ export class SubagentManager {
   }
 }
 
+/** Tells an isolated child where it works so it does not reach for the parent's checkout. */
+const isolationNote = (wt: Worktree): string =>
+  `You work in an isolated git worktree (branch ${wt.branch}) of ${wt.repo}, started from commit ${wt.base.slice(0, 8)}. Other agents cannot see your edits and you cannot see theirs. Leave your changes in place; your parent reviews and merges the branch.`;
+
 interface PendingChild {
   owner: string; parentId: string; depth: number; role: SubagentRole; name?: string;
   label: string; cwd: string; model?: unknown; modelLabel?: string; thinkingLevel?: string; preset?: string;
@@ -560,6 +584,7 @@ export function renderAgentLine(e: CatalogEntry, running: boolean): string {
   if (e.name) bits.push(`name=${e.name}`);
   if (e.role !== "child") bits.push(e.role);
   if (e.modelLabel) bits.push(e.modelLabel);
+  if (e.worktree && !e.worktree.removed) bits.push(`worktree=${e.worktree.branch}`);
   if (e.progress) bits.push(`· ${e.progress}`);
   return `${bits.join(" ")} — ${e.label}`;
 }

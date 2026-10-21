@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
 import {
-  RepeatTracker, spillText, pruneText, validateTodos, generateSdk,
+  RepeatTracker, spillText, validateTodos, generateSdk,
   newGoal, applyBlocker, renderGoalRound, renderTaskControlSection, validateRules, Semaphore, completedTurnCut,
   resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, parseOutputSchema,
   SANDBOX_ORDER, type TodoItem, type Goal, type SandboxMode,
@@ -16,19 +16,27 @@ import {
 import { JobRegistry } from "./jobs.ts";
 import { TerminalRegistry, PersistentBash, runShellJob } from "./terminal.ts";
 import { NodePtcProvider, MossbedProvider, PythonPtcProvider, type PtcBindings } from "./ptc.ts";
+import { Outbox, runInboxCommand } from "./outbox.ts";
+import { DEFAULT_KEEP_RECENT_RESULTS, DEFAULT_MAX_RESULT_CHARS, contextChars, imageExtension, planPrune, type ProjectedEntry } from "./pruner.ts";
 import { SubagentManager, renderAgentLine, type CatalogEntry } from "./subagent.ts";
 import { TeamBoard, renderTeamTask, type TeamTaskAction } from "./team.ts";
 import { PANEL_KEY, WIDGET_KEYS, columnsWidget, renderAgentsWidget, renderDashboard, renderJobsWidget, renderStatusLine, renderTodoWidget, renderWidgetSections, type UiState } from "./ui.ts";
 
-const ENTRY = { todo: "pi-dsh/todo", rules: "pi-dsh/rules", plan: "pi-dsh/plan", goal: "pi-dsh/goal", catalog: "pi-dsh/catalog", team: "pi-dsh/team-tasks" };
+const ENTRY = { todo: "pi-dsh/todo", rules: "pi-dsh/rules", plan: "pi-dsh/plan", goal: "pi-dsh/goal", catalog: "pi-dsh/catalog", team: "pi-dsh/team-tasks", outbox: "pi-dsh/outbox" };
 const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: {} });
 const errText = (t: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: t }], details, isError: true as const });
 
 interface Config {
-  allowParallelInProgress: boolean; spillMaxInlineTokens: number; pruneThresholdChars: number;
+  allowParallelInProgress: boolean; spillMaxInlineTokens: number;
+  /** Prune old tool results once Pi reports this share of the context window in use. */
+  pruneAtContextPercent: number;
+  /** Fallback pressure estimate (projected context characters) when Pi does not know the usage yet. */
+  pruneThresholdChars: number;
   ptcOnly: boolean; persistentPtc: boolean; maxActiveSubagents: number; goalBlockedThreshold: number;
   sandboxMode: SandboxMode; maxParallelSubCalls: number;
   completionDelivery: "wakeup" | "quiet"; maxConsecutiveWakes?: number;
+  /** How long an idle session waits to merge a burst of notices into one wake-up. */
+  noticeCoalesceMs: number;
   uiWidgets: boolean;
   toolTimeoutMs?: Record<string, number>; defaultToolTimeoutMs?: number;
   toolTimeoutAction: "abort" | "notify";
@@ -41,9 +49,9 @@ interface Config {
 }
 function loadConfig(): Config {
   const defaults: Config = {
-    allowParallelInProgress: true, spillMaxInlineTokens: 12500, pruneThresholdChars: 400_000,
+    allowParallelInProgress: true, spillMaxInlineTokens: 12500, pruneAtContextPercent: 60, pruneThresholdChars: 400_000,
     ptcOnly: false, persistentPtc: false, maxActiveSubagents: 8, goalBlockedThreshold: 3,
-    sandboxMode: "danger-full-access", maxParallelSubCalls: 10, completionDelivery: "wakeup",
+    sandboxMode: "danger-full-access", maxParallelSubCalls: 10, completionDelivery: "wakeup", noticeCoalesceMs: 100,
     uiWidgets: true, toolTimeoutAction: "abort", durableTerminals: false,
     maxSubagentDepth: 1, maxTeamMembers: 16, maxTeamTasks: 256,
   };
@@ -79,6 +87,10 @@ export default function (pi: any) {
   let goal: Goal | undefined;
   let humanTurn = false;
   let wakeCount = 0;
+  const outbox = new Outbox();
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Outcome of the latest turn; an aborted or failed run must not wake itself for stragglers. */
+  let lastOutcome: string | undefined;
   let pendingGoalRound: number | undefined;
   /** True once a goal round's first turn started in the current run. */
   let goalRoundRun = false;
@@ -92,17 +104,42 @@ export default function (pi: any) {
   const absent = new Set<string>();
 
   const remember = (ctx: any) => { lastCtx = ctx; try { owner = ctx.sessionManager.getSessionId(); } catch { /* keep */ } };
-  const notify = (content: string, customType = "pi-dsh/notice") => {
+  const persistOutbox = () => {
+    try { pi.appendEntry(ENTRY.outbox, outbox.snapshot()); } catch { /* session gone */ }
+    refreshUI();
+  };
+  /** Wake an idle session with every waiting notice as one message. `force` ignores quiet delivery and the wake cap. */
+  const flushIdle = (force = false) => {
+    flushTimer = undefined;
     try {
-      const quiet = config.completionDelivery === "quiet";
+      if (outbox.size === 0 || !lastCtx?.isIdle?.()) return; // a running session drains at its next boundary
       const capped = config.maxConsecutiveWakes !== undefined && wakeCount >= config.maxConsecutiveWakes;
-      if (lastCtx?.isIdle?.() && !quiet && !capped) { wakeCount++; pi.sendMessage({ customType, content, display: true }, { triggerTurn: true }); }
-      else if (lastCtx?.isIdle?.()) pi.sendMessage({ customType, content, display: true }, { deliverAs: "nextTurn" });
-      else pi.sendMessage({ customType, content, display: true }, { deliverAs: "steer" });
-    } catch { /* disposed session: notice is best-effort, state is durable */ }
+      if (!force && (config.completionDelivery === "quiet" || capped)) return; // waits for the next prompt
+      const batch = outbox.take();
+      if (!batch) return;
+      persistOutbox();
+      wakeCount++;
+      pi.sendMessage({ customType: batch.customType, content: batch.content, display: true }, { triggerTurn: true });
+    } catch { /* disposed session: the snapshot keeps the rest */ }
+  };
+  const scheduleFlush = () => {
+    if (flushTimer === undefined) flushTimer = setTimeout(flushIdle, config.noticeCoalesceMs);
+  };
+  /** Queue a notice. Delivery belongs to the boundary: turn_end / agent_before_settle mid-run, a coalesced wake when idle. */
+  const notify = (content: string, customType = "pi-dsh/notice", key?: string) => {
+    outbox.enqueue(customType, content, key);
+    persistOutbox();
+    scheduleFlush();
+  };
+  /** Boundary drain: append the next batch of notices to a turn_end / agent_before_settle result and keep the run going. */
+  const drainNotices = (e: { entries: any[] }) => {
+    const batch = outbox.take();
+    if (!batch) return undefined;
+    persistOutbox();
+    return { continue: true, entries: [...e.entries, { type: "custom_message" as const, customType: batch.customType, content: batch.content, display: true }] };
   };
   const uiState = (): UiState => ({
-    goal, todos, planActive,
+    goal, todos, planActive, inbox: outbox.size,
     jobs: jobs.list(owner), agents: subagents.list(owner), terminals: terminals.list(owner), teamTasks: board.snapshot(),
   });
   /** One refresh for every widget + status (DSH ui-goal/ui-jobs/ui-subagent, Pi-shaped). */
@@ -159,6 +196,7 @@ export default function (pi: any) {
   function restore(ctx: any) {
     remember(ctx);
     todos = []; rules = []; planActive = false; goal = undefined; teamEntries = []; pendingGoalRound = undefined; goalRoundRun = false; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
+    outbox.restore([]);
     const catalog: CatalogEntry[] = [];
     for (const e of ctx.sessionManager.getBranch()) {
       if (e.type !== "custom") continue;
@@ -167,6 +205,7 @@ export default function (pi: any) {
       if (e.customType === ENTRY.plan) { planActive = Boolean((e.data as any)?.active); if (typeof (e.data as any)?.prompt === "string" && planActive) pendingPlanPrompt = (e.data as any).prompt; }
       if (e.customType === ENTRY.goal) goal = e.data as Goal;
       if (e.customType === ENTRY.team) teamEntries = (e.data as unknown[]) ?? [];
+      if (e.customType === ENTRY.outbox) outbox.restore(e.data);
       if (e.customType === ENTRY.catalog) {
         const entry = e.data as CatalogEntry;
         const i = catalog.findIndex((c) => c.childId === entry.childId);
@@ -190,6 +229,7 @@ export default function (pi: any) {
     updateGoalWidget();
   });
   pi.on("session_shutdown", async () => {
+    if (flushTimer !== undefined) { clearTimeout(flushTimer); flushTimer = undefined; }
     await jobs.disposeOwner(owner, { keepDurable: true }).catch(() => undefined);
     await terminals.disposeOwner(owner, { keepDurable: true }).catch(() => undefined);
     await subagents.disposeOwner(owner).catch(() => undefined);
@@ -212,14 +252,18 @@ export default function (pi: any) {
     const control = currentControlSection();
     e.systemPromptOptions.sections["pi_dsh"] = control;
     lastControlSection = control;
-    if (!planActive) return undefined;
+    // Notices that waited for a turn (quiet delivery, wake cap, restart) ride in with this prompt.
+    const notices = outbox.take();
+    if (notices) persistOutbox();
+    if (!planActive) return notices ? { message: { customType: notices.customType, content: notices.content, display: true } } : undefined;
     // Deliver a /plan <task> queued headlessly (print mode may never run the
     // follow-up user message; whichever turn happens first carries the task).
     const queued = pendingPlanPrompt;
     pendingPlanPrompt = undefined;
+    const plan = `Plan mode is active. Explore and design before executing. Do not make changes yet. When the plan is complete, call exit_plan_mode with the full plan as markdown for user review.${queued ? `\n\nPlan task (from /plan): ${queued}` : ""}`;
     return { message: {
-      customType: "pi-dsh/plan", display: false,
-      content: `Plan mode is active. Explore and design before executing. Do not make changes yet. When the plan is complete, call exit_plan_mode with the full plan as markdown for user review.${queued ? `\n\nPlan task (from /plan): ${queued}` : ""}`,
+      customType: "pi-dsh/plan", display: notices !== undefined,
+      content: notices ? `${plan}\n\n${notices.content}` : plan,
     } };
   });
 
@@ -246,7 +290,7 @@ export default function (pi: any) {
   pi.on("tool_call", async (e: any, ctx: any) => {
     remember(ctx);
     const reminder = repeat.observe(e.toolName, e.input);
-    if (reminder) notify(reminder, "pi-dsh/repeat-reminder");
+    if (reminder) notify(reminder, "pi-dsh/repeat-reminder", "repeat-reminder");
     const capMs = Math.min(resolveToolTimeoutMs(e.toolName, config) ?? 600_000, 600_000);
     for (const { field, capped } of timeoutFieldCaps(e.input, capMs)) e.input[field] = capped;
     if ((e.toolName === "edit" || e.toolName === "write") && typeof e.input?.path === "string") {
@@ -321,59 +365,41 @@ export default function (pi: any) {
     return undefined;
   });
 
-  // ---- Pruner (context) ----
+  // ---- Control section (context) ----
+  // The request-time edit is not stored, so it only carries the control state;
+  // pruning is a stored edit made at turn_end (see below).
   pi.on("context", async (e: any) => {
-    const size = JSON.stringify(e.messages).length;
-    if (size < config.pruneThresholdChars) {
-      const control = currentControlSection();
-      if (hasControlState() && control !== lastControlSection) {
-        lastControlSection = control;
-        return { messages: [...e.messages, {
-          role: "custom", customType: "pi-dsh/control", display: false, timestamp: Date.now(),
-          content: [{ type: "text", text: `<pi_dsh>\n${control}\n</pi_dsh>` }],
-        }] };
-      }
-      return undefined;
-    }
-    const toolIdx = e.messages.map((m: any, i: number) => (m.role === "toolResult" ? i : -1)).filter((i: number) => i >= 0);
-    const keepFrom = toolIdx.length > 6 ? (toolIdx[toolIdx.length - 6] as number) : Number.POSITIVE_INFINITY;
-    let changed = false;
-    const messages = [];
-    const offloadDir = join(homedir(), ".pi", "agent", "pi-dsh", "spill", owner);
-    for (let i = 0; i < e.messages.length; i++) {
-      const m = e.messages[i];
-      const isOld = i < keepFrom;
-      if ((m.role !== "toolResult" && m.role !== "user") || !isOld) { messages.push(m); continue; }
-      const content = [];
-      for (const c of m.content ?? []) {
-        if (c.type === "image" && typeof c.data === "string") {
-          try {
-            mkdirSync(offloadDir, { recursive: true });
-            const ext = c.mimeType === "image/jpeg" ? "jpg" : "png";
-            const file = join(offloadDir, `offload-${i}-${content.length}.${ext}`);
-            writeFileSync(file, Buffer.from(c.data, "base64"));
-            changed = true;
-            content.push({ type: "text", text: `[image offloaded under context pressure: ${file}; load with read_image]` });
-            continue;
-          } catch { /* keep inline */ }
-        }
-        if (m.role === "toolResult" && c.type === "text" && c.text.length > 8000) {
-          changed = true; content.push({ ...c, text: pruneText(c.text, 8000) }); continue;
-        }
-        content.push(c);
-      }
-      messages.push({ ...m, content });
-    }
     const control = currentControlSection();
-    if (hasControlState() && control !== lastControlSection) {
-      lastControlSection = control;
-      messages.push({
-        role: "custom", customType: "pi-dsh/control", display: false, timestamp: Date.now(),
-        content: [{ type: "text", text: `<pi_dsh>\n${control}\n</pi_dsh>` }],
-      });
-      changed = true;
-    }
-    return changed ? { messages } : undefined;
+    if (!hasControlState() || control === lastControlSection) return undefined;
+    lastControlSection = control;
+    return { messages: [...e.messages, {
+      role: "custom", customType: "pi-dsh/control", display: false, timestamp: Date.now(),
+      content: [{ type: "text", text: `<pi_dsh>\n${control}\n</pi_dsh>` }],
+    }] };
+  });
+
+  // ---- Pruner (context_edit at turn_end) ----
+  const offloadImage = (data: string, mimeType: string | undefined, tag: string): string | undefined => {
+    const dir = join(homedir(), ".pi", "agent", "pi-dsh", "spill", owner);
+    try {
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `offload-${tag}.${imageExtension(mimeType)}`);
+      writeFileSync(file, Buffer.from(data, "base64"));
+      return file;
+    } catch { return undefined; }
+  };
+  /** Context usage when Pi knows it, else a character estimate of the projected context. */
+  const underContextPressure = (ctx: any, entries: ProjectedEntry[]): boolean => {
+    const percent = ctx.getContextUsage?.()?.percent;
+    return typeof percent === "number" ? percent >= config.pruneAtContextPercent : contextChars(entries) >= config.pruneThresholdChars;
+  };
+  pi.on("turn_end", async (e: any, ctx: any) => {
+    if (e.outcome !== "completed") return undefined;
+    const entries: ProjectedEntry[] = e.context.contextEntries;
+    if (!underContextPressure(ctx, entries)) return undefined;
+    const edits = planPrune(entries, { keepRecentResults: DEFAULT_KEEP_RECENT_RESULTS, maxResultChars: DEFAULT_MAX_RESULT_CHARS, offloadImage });
+    if (edits.length === 0) return undefined;
+    return { entries: [...e.entries, ...edits.map((edit) => ({ type: "context_edit" as const, targetId: edit.targetId, replacement: { content: edit.content } }))] };
   });
 
   // ---- todo_write ----
@@ -556,7 +582,7 @@ export default function (pi: any) {
       sandbox_permissions: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write"), Type.Literal("danger-full-access")])),
       justification: Type.Optional(Type.String()),
     }),
-    async execute(_id: string, p: any, _s: unknown, _u: unknown, ctx: any) {
+    async execute(_id: string, p: any, signal: AbortSignal | undefined, _u: unknown, ctx: any) {
       remember(ctx);
       const sb = await resolveSandbox(ctx, p.sandbox_permissions, p.justification);
       if ("error" in sb) return errText(`Error: ${sb.error}`);
@@ -564,7 +590,12 @@ export default function (pi: any) {
       const jobId = startBashJob(p.command, cwd, p.description ?? "", sb.mode);
       if (p.run_in_background) return text(`started background job ${jobId}`);
       const timeoutMs = Math.min(Math.max(1, (p.timeout ?? 120)) * 1000, 600_000);
-      const r = await jobs.output(jobId, owner, { wait: true, timeoutMs });
+      const r = await jobs.output(jobId, owner, { wait: true, timeoutMs, signal });
+      if (signal?.aborted) {
+        // Escape means stop: a foreground command dies with the turn, as with Pi's stock bash.
+        await jobs.kill(jobId, owner, "aborted").catch(() => undefined);
+        return errText(`${r.text.replace(/\n\[status: \w+\]$/, "")}\n[command aborted]`.trim());
+      }
       if (r.job.status === "running") return text(`${r.text}\n[command still running as background job ${jobId}; read it with job_output]`);
       return text(r.text.replace(/\n\[status: \w+\]$/, ""));
     },
@@ -738,13 +769,15 @@ export default function (pi: any) {
     return msgs.slice(0, completedTurnCut(msgs));
   };
   const THINKING = Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")]));
+  const ISOLATION = Type.Optional(Type.Literal("worktree"));
+  const ISOLATION_NOTE = 'isolation="worktree" gives the child its own git checkout and branch (started from HEAD, so your uncommitted edits are not visible to it); use it when several children may write the same files. An untouched worktree is removed when the child settles; one with work is kept and the completion notice says how to review, merge, or discard it.';
   const delegate = (provider: "spawn" | "fork", name: string, contextNote: string) => pi.registerTool({
     name, label: `Subagent (${provider})`, exposure: "model-only" as const,
-    description: `Delegate work to a fresh child agent and return its id immediately; the final answer arrives in a completion notice. ${contextNote} The child shares the workspace and runs at depth 1 of ${config.maxSubagentDepth}. Optional: model (provider/modelId, see list_subagent_models), thinking_level, preset (spawn only), timeout_ms, output_schema (requires structured_output). Use for bounded, self-contained subtasks; start independent delegations together. In single-shot print runs, collect results with wait_agent before finishing — background children are aborted when the process exits.`,
+    description: `Delegate work to a fresh child agent and return its id immediately; the final answer arrives in a completion notice. ${contextNote} The child shares the workspace and runs at depth 1 of ${config.maxSubagentDepth}. Optional: model (provider/modelId, see list_subagent_models), thinking_level, preset (spawn only), timeout_ms, output_schema (requires structured_output). Use for bounded, self-contained subtasks; start independent delegations together. ${ISOLATION_NOTE} In single-shot print runs, collect results with wait_agent before finishing — background children are aborted when the process exits.`,
     parameters: Type.Object({
       task: Type.String(), label: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
       model: Type.Optional(Type.String()), thinking_level: THINKING, preset: Type.Optional(Type.String()),
-      timeout_ms: Type.Optional(Type.Number()),
+      timeout_ms: Type.Optional(Type.Number()), isolation: ISOLATION,
       // Models often stringify the schema; accept both shapes and parse below.
       output_schema: Type.Optional(Type.Union([Type.Object({}, { additionalProperties: true }), Type.String()])),
       require_structured: Type.Optional(Type.Boolean()),
@@ -769,7 +802,7 @@ export default function (pi: any) {
           thinkingLevel: p.thinking_level ?? preset?.thinkingLevel, preset: p.preset,
           tools: preset?.tools, systemAppend: preset?.systemAppend,
           timeoutMs: p.timeout_ms, outputSchema: parseOutputSchema(p.output_schema),
-          requireStructured: p.require_structured === true,
+          requireStructured: p.require_structured === true, isolation: p.isolation,
           seedMessages: provider === "fork" ? forkSeed(ctx) : undefined, delivery: "parent",
         });
         return text(`started subagent ${childId}`);
@@ -861,11 +894,11 @@ export default function (pi: any) {
   board.onChange = () => persistTeam();
   pi.registerTool({
     name: "spawn_teammate", label: "Spawn teammate", exposure: "model-only",
-    description: "Create a named teammate (lead only). Names are permanent lowercase slugs, never reused. The teammate shares this workspace and the team task board, can message any member by name, and can claim board tasks. fork=true seeds it with your completed turns. Returns its id; results arrive as completion notices, or via wait_agent.",
+    description: `Create a named teammate (lead only). Names are permanent lowercase slugs, never reused. The teammate shares this workspace and the team task board, can message any member by name, and can claim board tasks. fork=true seeds it with your completed turns. ${ISOLATION_NOTE} Returns its id; results arrive as completion notices, or via wait_agent.`,
     parameters: Type.Object({
       name: Type.String(), task: Type.String(), description: Type.Optional(Type.String()),
       fork: Type.Optional(Type.Boolean()), model: Type.Optional(Type.String()), thinking_level: THINKING,
-      preset: Type.Optional(Type.String()), timeout_ms: Type.Optional(Type.Number()),
+      preset: Type.Optional(Type.String()), timeout_ms: Type.Optional(Type.Number()), isolation: ISOLATION,
     }),
     async execute(_i: string, p: any, _s: unknown, _u: unknown, ctx: any) {
       remember(ctx);
@@ -883,7 +916,7 @@ export default function (pi: any) {
           provider: p.fork === true ? "fork" : "spawn", label: `team:${name}`, name, role: "teammate",
           task: String(p.task), owner, cwd: ctx.cwd, model: modelRes.model, modelLabel: modelRes.label,
           thinkingLevel: p.thinking_level ?? presetRes.preset?.thinkingLevel, preset: p.preset,
-          tools: presetRes.preset?.tools, timeoutMs: p.timeout_ms, delivery: "parent",
+          tools: presetRes.preset?.tools, timeoutMs: p.timeout_ms, delivery: "parent", isolation: p.isolation,
           seedMessages: p.fork === true ? forkSeed(ctx) : undefined,
           systemAppend: [p.description ? `Your role on the team: ${String(p.description)}` : "", presetRes.preset?.systemAppend ?? ""].filter(Boolean).join("\n\n") || undefined,
         });
@@ -1125,6 +1158,16 @@ export default function (pi: any) {
       safeNotify(ctx, rows.length ? rows.join("\n") : "No terminals.");
     },
   });
+  pi.registerCommand("inbox", {
+    description: "Notices waiting for the model (/inbox [list | show <id> | drop <id> | clear | flush])",
+    handler: async (args: string, ctx: any) => {
+      remember(ctx);
+      const result = runInboxCommand(outbox, args);
+      if (result.changed) persistOutbox();
+      safeNotify(ctx, result.text);
+      if (result.flush) flushIdle(true);
+    },
+  });
   // Goal round driver (dsh goal-round-driver, Pi-shaped). A round is admitted at
   // the settle boundary as a continuation of the running run: it cannot race a
   // human prompt, needs no synthetic user message, and an abort (which skips the
@@ -1137,9 +1180,23 @@ export default function (pi: any) {
     goal.revision++;
     persistGoal();
   };
+  // Notice delivery runs first at each boundary: waiting notices become one
+  // message that continues the run, and the goal driver below then defers its
+  // next round until the model has reacted to them.
+  pi.on("turn_end", async (e: any, ctx: any) => {
+    remember(ctx);
+    lastOutcome = e.outcome;
+    if (e.outcome !== "completed" || outbox.size === 0) return undefined;
+    return drainNotices(e);
+  });
   pi.on("agent_before_settle", async (e: any, ctx: any) => {
     remember(ctx);
-    if (!goal || goal.status !== "active" || !goal.armed) return undefined;
+    if (e.outcome !== "completed" || outbox.size === 0 || ctx.hasPendingMessages()) return undefined;
+    return drainNotices(e);
+  });
+  pi.on("agent_before_settle", async (e: any, ctx: any) => {
+    remember(ctx);
+    if (e.continue || !goal || goal.status !== "active" || !goal.armed) return undefined;
     // dsh disarms on agent errors so a failing run cannot burn the round budget.
     if (e.outcome === "error") { disarmGoal(); safeNotify(ctx, "Goal disarmed: the run ended with an error. /goal resume to continue.", "warning"); return undefined; }
     if (e.outcome !== "completed" || ctx.hasPendingMessages()) return undefined;
@@ -1150,10 +1207,12 @@ export default function (pi: any) {
     }
     pendingGoalRound = goal.roundsStarted + 1;
     humanTurn = false;
-    return { continue: true, entries: [{ type: "custom_message", customType: "pi-dsh/goal-round", content: renderGoalRound(goal, pendingGoalRound), display: true }] };
+    return { continue: true, entries: [...e.entries, { type: "custom_message", customType: "pi-dsh/goal-round", content: renderGoalRound(goal, pendingGoalRound), display: true }] };
   });
   pi.on("agent_settled", async (e: any, ctx: any) => {
     remember(ctx); humanTurn = false;
+    // Notices that arrived after the last boundary still reach an idle session; an aborted or failed run waits for the next prompt.
+    if (!e.aborted && lastOutcome === "completed" && outbox.size > 0) scheduleFlush();
     const wasRoundRun = goalRoundRun; goalRoundRun = false;
     const unstarted = pendingGoalRound; pendingGoalRound = undefined;
     if (!goal || goal.status !== "active" || !goal.armed) return;

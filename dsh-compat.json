@@ -46,6 +46,18 @@
       "notes": "Rounds are admitted at Pi's agent_before_settle boundary (continue + custom_message) instead of DSH's Agent.followup(); abort pauses an admitted round and disarms otherwise, /goal pause aborts the live turn, error outcomes disarm, and a round that never reaches its first turn blocks the goal (queue-failed). Not ported: DSH's per-round message identity fence (goalId/revision/round) and wrap-up context after complete/blocked."
     },
     {
+      "area": "Inbox",
+      "status": "partial",
+      "dshPackages": [
+        "packages/core/agent-loop"
+      ],
+      "piTools": [],
+      "piCommands": [
+        "inbox"
+      ],
+      "notes": "DSH's agent inbox is a durable projection with next-turn and next-step lanes. pi-dsh keeps its own notices (job/subagent/agent-message/goal/timeout) in a session-entry outbox, drained at Pi's turn_end and agent_before_settle boundaries with coalescing, key-based replacement, and a /inbox view. Not ported: item-level edit and lane transfer, and a durable lane for the user's own steer/follow-up messages, which Pi keeps in memory."
+    },
+    {
       "area": "Standing rules",
       "status": "partial",
       "dshPackages": [
@@ -79,7 +91,8 @@
         "packages/spill/spill-policy",
         "packages/compaction/compaction-tool-result-pruner"
       ],
-      "piTools": []
+      "piTools": [],
+      "notes": "Pruning mirrors DSH's persistent, replay-safe tool-result pruner: replacements are stored as Pi context_edit entries at turn_end instead of request-time rewrites. Unlike DSH (which prunes at compaction, every over-budget result), pi-dsh triggers on context-window pressure and leaves the newest six tool results whole; head/tail budgets are 8000 chars per result rather than DSH's 4096+1024."
     },
     {
       "area": "Jobs",
@@ -155,7 +168,7 @@
       "piCommands": [
         "agents"
       ],
-      "notes": "Tree-wide capacity (8), maxSubagentDepth (default 1) with child-visible delegation tools below the cap, adjacent messaging both directions with messageIds, per-child model/thinking/preset selection, timeouts, progress/activity via agent_status, descriptor-persisted catalog (result replay + cold resume after restart), and the agent-team board (CAS revisions, blockedBy readiness, writeScope overlap warnings, wait-for-change) visible to teammates as scoped tools. Deltas: presets are pi-dsh config objects, not DSH preset-registry compositions; interrupt waits for settle instead of returning on acceptance; child bash honors the standing sandboxMode through a confined foreground bash (no owned background jobs in children); team state is one board per root session persisted as session entries."
+      "notes": "Tree-wide capacity (8), maxSubagentDepth (default 1) with child-visible delegation tools below the cap, adjacent messaging both directions with messageIds, per-child model/thinking/preset selection, timeouts, progress/activity via agent_status, descriptor-persisted catalog (result replay + cold resume after restart), and the agent-team board (CAS revisions, blockedBy readiness, writeScope overlap warnings, wait-for-change) visible to teammates as scoped tools. Deltas: presets are pi-dsh config objects, not DSH preset-registry compositions; interrupt waits for settle instead of returning on acceptance; child bash honors the standing sandboxMode through a confined foreground bash (no owned background jobs in children); team state is one board per root session persisted as session entries. pi-dsh addition with no DSH counterpart: isolation=\"worktree\" (DSH agent-team shares one workspace and offers only advisory writeScopes overlap warnings and no Git controls)."
     },
     {
       "area": "Subagent external providers",

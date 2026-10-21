@@ -116,15 +116,13 @@ export class JobRegistry {
     const job = this.jobs.get(id);
     return job && job.owner === owner ? job : undefined;
   }
-  async output(id: string, owner: string, opts?: { wait?: boolean; timeoutMs?: number }): Promise<{ text: string; job: JobSnapshot }> {
+  /** With `wait`, blocks until the job settles, the timeout passes, or `signal` aborts; the job keeps running in every case. */
+  async output(id: string, owner: string, opts?: { wait?: boolean; timeoutMs?: number; signal?: AbortSignal }): Promise<{ text: string; job: JobSnapshot }> {
     const job = this.get(id, owner);
     if (!job) throw new Error(`unknown job: ${id}`);
     if (opts?.wait && job.snap.status === "running") {
       job.awaited = true;
-      await Promise.race([
-        new Promise<void>((resolve) => job.settleWaiters.push(resolve)),
-        new Promise((resolve) => setTimeout(resolve, Math.min(opts.timeoutMs ?? 30_000, 600_000))),
-      ]);
+      await this.waitForSettle(job, Math.min(opts.timeoutMs ?? 30_000, 600_000), opts.signal);
     }
     let text = job.ring.readNew();
     if (job.snap.status !== "running" && job.snap.result !== undefined && !job.resultDelivered) {
@@ -132,6 +130,15 @@ export class JobRegistry {
       text += (text ? "\n" : "") + job.snap.result;
     }
     return { text: `${text}\n[status: ${job.snap.status}]`, job: { ...job.snap } };
+  }
+  private async waitForSettle(job: Job, timeoutMs: number, signal: AbortSignal | undefined): Promise<void> {
+    let wake!: () => void;
+    const woken = new Promise<void>((resolve) => { wake = resolve; });
+    job.settleWaiters.push(wake);
+    const timer = setTimeout(wake, timeoutMs);
+    if (signal?.aborted) wake(); else signal?.addEventListener("abort", wake, { once: true });
+    try { await woken; }
+    finally { clearTimeout(timer); signal?.removeEventListener("abort", wake); }
   }
   async kill(id: string, owner: string, _reason?: string): Promise<{ outcome: string; job: JobSnapshot }> {
     const job = this.get(id, owner);

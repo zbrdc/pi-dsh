@@ -12,13 +12,14 @@ Pi-dsh is a semantic reimplementation for Pi APIs, not a line-by-line source por
 |---|---|---|
 | Tasks | `todo_write`, `/plan`, `exit_plan_mode` | tool-todo, plan-mode |
 | Goals | `create_goal`, `get_goal`, `update_goal`, `/goal`, round driver (continues at Pi's settle boundary; abort pauses) with reviewer audit gate | goal, goal-round-driver, tool-goal |
+| Inbox | completion and warning notices wait in a durable outbox (session entries), then reach the model as one coalesced message at the next step boundary, or as one wake-up when idle; `/inbox` (list, show, drop, clear, flush) | agent-loop inbox (closest) |
 | Standing rules | `rules_write`, `/rules` — durable user instructions re-injected after every compaction (pi-dsh addition) | agent-instructions (closest) |
 | Guards | repeat-call reminders (3/5/8), timeout input caps on all tools, per-tool deadlines (`toolTimeoutMs`): fused signals for nested calls, top-level watchdog → `TOOL_TIMEOUT`; read-before-edit + stale-version FS policy, `read_image` | guard/*, fs-observation-policy, tool-fs |
-| Context | spill to file + locator, tool-result pruner at compaction pressure | spill-policy, compaction-tool-result-pruner |
+| Context | spill to file + locator; tool-result pruner that stores `context_edit` entries once the context passes `pruneAtContextPercent` (older oversized results cut to head and tail, images moved to disk; the newest six results stay whole) | spill-policy, compaction-tool-result-pruner |
 | Jobs | `job_output/list/kill`, owned `bash` (background promotion, bwrap sandbox + escalation approval), durable output files, completion wakes with caps | jobs, tool-jobs, tool-bash, sandbox-policy |
 | Terminals | `terminal_open/send/read/list/close/signal/resize`, `bash_persistent`, `pwsh(_persistent)` when a binary exists; `durable: true` runs in detached tmux and reattaches after a Pi restart | terminal, tool-terminal, tool-bash-persistent |
 | UI | widgets for goal, todos, jobs, agents/terminals/team + combined status line; `/dsh` dashboard, `/todos`, `/jobs` (kill), `/agents`, `/terminals` (close) | client/ui-goal, ui-jobs, ui-subagent, ui-plan |
-| Subagents | `subagent`, `subagent_fork` (explicit completed-turn seed) with per-child `model`, `thinking_level`, `preset`, `timeout_ms`, `output_schema`; `send_message` (adjacent, both directions, messageIds), `interrupt_agent`, `list_agents` (children/descendants), `agent_status`, `list_subagent_models`; capacity 8/tree, depth cap (`maxSubagentDepth`), cold resume after restart; teams: `spawn_teammate`, `wait_agent` (settle or next team change), CAS `team_task_*` board visible to teammates | subagent, spawn/fork, tool-subagent(-control), experimental agent-team |
+| Subagents | `subagent`, `subagent_fork` (explicit completed-turn seed) with per-child `model`, `thinking_level`, `preset`, `timeout_ms`, `output_schema`; `send_message` (adjacent, both directions, messageIds), `interrupt_agent`, `list_agents` (children/descendants), `agent_status`, `list_subagent_models`; capacity 8/tree, depth cap (`maxSubagentDepth`), cold resume after restart, `isolation: "worktree"` (own git checkout and branch; an untouched one is removed when the child settles, otherwise the completion notice says how to review, merge, or discard it); teams: `spawn_teammate`, `wait_agent` (settle or next team change), CAS `team_task_*` board visible to teammates | subagent, spawn/fork, tool-subagent(-control), experimental agent-team |
 | PTC | `run_code` with schema-typed SDK, 10-way sub-call scheduler, image results; Node (per-call/persistent REPL retaining declarations), Python, and mossbed backends | ptc-runtime(-node), ptc-runtime-python, dsh-tools PTC mode |
 | Workflow | `workflow` (`agent`/`parallel`/`pipeline`/`phase`/`log`), background as a job | workflow-ptc, tool-workflow |
 
@@ -77,6 +78,7 @@ Optional config at `~/.pi/agent/pi-dsh.json` (defaults shown). A starter file is
 {
   "allowParallelInProgress": true,
   "spillMaxInlineTokens": 12500,
+  "pruneAtContextPercent": 60,
   "pruneThresholdChars": 400000,
   "ptcOnly": false,
   "persistentPtc": false,
@@ -87,6 +89,7 @@ Optional config at `~/.pi/agent/pi-dsh.json` (defaults shown). A starter file is
   "maxParallelSubCalls": 10,
   "completionDelivery": "wakeup",
   "maxConsecutiveWakes": null,
+  "noticeCoalesceMs": 100,
   "uiWidgets": true,
   "toolTimeoutMs": null,
   "defaultToolTimeoutMs": null,
