@@ -12,6 +12,7 @@ import { readFile, stat } from "node:fs/promises";
 import { Type } from "typebox";
 import { RepeatTracker, captureStructuredSubmission, completedTurnCut, normalizeStructured, pruneText, spillText, timeoutFieldCaps } from "./core.ts";
 import { renderTeamTask, type TeamBoard, type TeamTaskAction } from "./team.ts";
+import { createSandboxedBash, isRestrictive, type ChildSandbox } from "./child-bash.ts";
 
 export type StopReason = "completed" | "failed" | "killed" | "timeout" | "interrupted" | "host-exit";
 export interface ActivationResult { childId: string; text: string; data?: unknown; status: "completed" | "failed" | "killed"; stopReason?: StopReason }
@@ -53,6 +54,8 @@ export interface CreateChildOpts {
   childDir: string; seedMessages?: any[]; openFile?: string;
   requireStructured?: boolean; outputSchema?: Record<string, unknown>;
   extraTools?: any[]; prompt?: ChildPromptOpts;
+  /** Standing sandbox the child's bash must honor; absent or danger-full-access keeps pi's stock bash. */
+  sandbox?: ChildSandbox;
 }
 export type CreateChildFn = (opts: CreateChildOpts) => Promise<ChildHandle>;
 
@@ -94,6 +97,8 @@ export class SubagentManager {
   opts: {
     maxActive?: number; childDir?: string; maxDepth?: number; defaultTimeoutMs?: number;
     createChild?: CreateChildFn; board?: TeamBoard;
+    /** Standing sandbox for children (parent sandboxMode + runner). */
+    sandbox?: ChildSandbox;
     /** Resolve a persisted model route label back to a live model (cold resume). */
     resolveModel?: (label: string) => unknown;
   };
@@ -222,7 +227,7 @@ export class SubagentManager {
       systemAppend: opts.systemAppend, childDir: this.childDir(),
       seedMessages: opts.provider === "fork" ? opts.seedMessages : undefined,
       requireStructured: opts.requireStructured === true || opts.outputSchema !== undefined,
-      outputSchema: opts.outputSchema, extraTools,
+      outputSchema: opts.outputSchema, extraTools, sandbox: this.opts.sandbox,
       prompt: { name: opts.name, role: pending.role, depth, maxDepth: this.maxDepth, teamPolicy: pending.role === "teammate" },
     });
     identity.childId = handle.sessionId;
@@ -391,7 +396,7 @@ export class SubagentManager {
     a.handle = await this.createChild()({
       cwd: a.entry.cwd, tools: a.entry.tools ?? [...DEFAULT_TOOLS, "structured_output"], childDir: this.childDir(), model: resumedModel,
       thinkingLevel: a.entry.thinkingLevel, openFile: a.entry.sessionFile, systemAppend: a.systemAppend,
-      requireStructured: a.requireStructured === true, outputSchema: a.outputSchema, extraTools,
+      requireStructured: a.requireStructured === true, outputSchema: a.outputSchema, extraTools, sandbox: this.opts.sandbox,
       prompt: { name: a.entry.name, role: a.entry.role, depth: a.entry.depth, maxDepth: this.maxDepth, teamPolicy: a.entry.role === "teammate" },
     });
     identity.childId = a.handle.sessionId;
@@ -689,7 +694,10 @@ function createChildPolicyExtension(): (pi: any) => void {
   };
 }
 
-async function createSdkChild(opts: CreateChildOpts): Promise<ChildHandle> {
+/** Test seam: callers may supply the model runtime a child session resolves providers from. */
+export interface SdkChildOverrides { modelRuntime?: unknown }
+
+export async function createSdkChild(opts: CreateChildOpts, overrides: SdkChildOverrides = {}): Promise<ChildHandle> {
   const sdk: any = await import("@earendil-works/pi-coding-agent");
   let structured: unknown;
   const structuredTool = {
@@ -699,7 +707,8 @@ async function createSdkChild(opts: CreateChildOpts): Promise<ChildHandle> {
     async execute(_id: string, params: any) {
       if (structured !== undefined) throw new Error("structured output already recorded: the run is complete");
       structured = opts.outputSchema !== undefined ? normalizeStructured(params) : captureStructuredSubmission(params);
-      return { content: [{ type: "text", text: "Structured result recorded." }], details: {} };
+      // terminate ends the loop once every tool of the batch agrees; no abort is needed.
+      return { content: [{ type: "text", text: "Structured result recorded." }], details: {}, terminate: true };
     },
   };
   const agentDir = sdk.getAgentDir ? sdk.getAgentDir() : join(homedir(), ".pi", "agent");
@@ -721,16 +730,13 @@ async function createSdkChild(opts: CreateChildOpts): Promise<ChildHandle> {
   const { session } = await sdk.createAgentSession({
     cwd: opts.cwd, resourceLoader: loader, sessionManager,
     model: opts.model, thinkingLevel: opts.thinkingLevel,
-    tools: opts.tools, customTools: [structuredTool, ...(opts.extraTools ?? [])],
+    tools: opts.tools, customTools: [structuredTool, ...(opts.extraTools ?? []), ...confinedBash(opts)],
+    ...(overrides.modelRuntime === undefined ? {} : { modelRuntime: overrides.modelRuntime }),
   });
   const handle: ChildHandle = {
     sessionId: session.sessionId,
     get sessionFile() { return session.sessionFile; },
-    prompt: async (text: string) => {
-      const iv = setInterval(() => { if (structured !== undefined) { clearInterval(iv); void session.abort().catch(() => undefined); } }, 200);
-      if (typeof (iv as any).unref === "function") (iv as any).unref();
-      try { await session.prompt(text); } finally { clearInterval(iv); }
-    },
+    prompt: (text: string) => session.prompt(text),
     steer: (text: string) => session.steer(text),
     followUp: (text: string) => session.followUp(text),
     abort: () => session.abort(),
@@ -740,5 +746,16 @@ async function createSdkChild(opts: CreateChildOpts): Promise<ChildHandle> {
     subscribe: typeof session.subscribe === "function" ? (listener: (event: any) => void) => session.subscribe(listener) : undefined,
     dispose: () => { try { session.dispose(); } catch { /* already disposed */ } },
   };
+  // terminate only ends a batch in which every tool agrees. When the model submits
+  // alongside other tools, close the run at the turn boundary instead.
+  session.subscribe((event: any) => {
+    if (event?.type !== "turn_end" || structured === undefined) return;
+    if ((event.toolResults ?? []).some((r: any) => r.toolName !== "structured_output")) void session.abort().catch(() => undefined);
+  });
   return handle;
+}
+
+/** The sandboxed bash that replaces pi's stock bash when the standing mode confines the parent. */
+function confinedBash(opts: CreateChildOpts): any[] {
+  return isRestrictive(opts.sandbox) && opts.tools.includes("bash") ? [createSandboxedBash(opts.sandbox)] : [];
 }

@@ -67,6 +67,7 @@ export default function (pi: any) {
   const subagents = new SubagentManager({
     maxActive: config.maxActiveSubagents, maxDepth: config.maxSubagentDepth,
     defaultTimeoutMs: config.subagentTimeoutMs, board,
+    sandbox: { mode: config.sandboxMode, runner: config.sandboxRunnerCommand },
   });
   const watchdog = new ToolWatchdog();
 
@@ -79,6 +80,8 @@ export default function (pi: any) {
   let humanTurn = false;
   let wakeCount = 0;
   let pendingGoalRound: number | undefined;
+  /** True once a goal round's first turn started in the current run. */
+  let goalRoundRun = false;
   let pendingPlanPrompt: string | undefined;
   let lastControlSection = "";
   let teamEntries: unknown[] = [];
@@ -155,7 +158,7 @@ export default function (pi: any) {
 
   function restore(ctx: any) {
     remember(ctx);
-    todos = []; rules = []; planActive = false; goal = undefined; teamEntries = []; pendingGoalRound = undefined; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
+    todos = []; rules = []; planActive = false; goal = undefined; teamEntries = []; pendingGoalRound = undefined; goalRoundRun = false; pendingPlanPrompt = undefined; observed.clear(); absent.clear();
     const catalog: CatalogEntry[] = [];
     for (const e of ctx.sessionManager.getBranch()) {
       if (e.type !== "custom") continue;
@@ -200,7 +203,7 @@ export default function (pi: any) {
     remember(ctx);
     // A queued goal round counts only once its turn actually starts (admission).
     if (goal && pendingGoalRound !== undefined) {
-      goal.roundsStarted = pendingGoalRound; pendingGoalRound = undefined; persistGoal();
+      goal.roundsStarted = pendingGoalRound; pendingGoalRound = undefined; goalRoundRun = true; persistGoal();
     }
     updateGoalWidget();
   });
@@ -1070,6 +1073,8 @@ export default function (pi: any) {
       else if (a === "resume" && goal) { goal.status = "active"; goal.armed = true; goal.revision++; }
       else if (a !== "pause" && a !== "resume") goal = newGoal(`goal-${Date.now()}`, expandAttachments(a, ctx.cwd));
       persistGoal(); safeNotify(ctx, `Goal: ${goal?.status} — ${goal?.objective}`);
+      // A host pause stops the live turn too, so the model cannot keep acting (dsh goal-round-driver).
+      if (a === "pause" && goal?.status === "paused" && !ctx.isIdle()) ctx.abort();
     },
   });
   // ---- Dashboard commands (user-facing views over widget state) ----
@@ -1120,19 +1125,47 @@ export default function (pi: any) {
       safeNotify(ctx, rows.length ? rows.join("\n") : "No terminals.");
     },
   });
-  // Goal round driver: continue at quiescence while armed, allowance remains, no live descendants.
-  pi.on("agent_settled", async (_e: any, ctx: any) => {
-    remember(ctx); humanTurn = false;
-    if (!goal || goal.status !== "active" || !goal.armed) return;
-    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-    if (subagents.hasLive(owner) || jobs.hasRunning(owner)) return;
+  // Goal round driver (dsh goal-round-driver, Pi-shaped). A round is admitted at
+  // the settle boundary as a continuation of the running run: it cannot race a
+  // human prompt, needs no synthetic user message, and an abort (which skips the
+  // boundary) ends the loop. Rounds chain inside one run, so the boundary also
+  // drops the human authority of the prompt that started it.
+  const disarmGoal = (status?: "paused") => {
+    if (!goal) return;
+    goal.armed = false;
+    if (status) goal.status = status;
+    goal.revision++;
+    persistGoal();
+  };
+  pi.on("agent_before_settle", async (e: any, ctx: any) => {
+    remember(ctx);
+    if (!goal || goal.status !== "active" || !goal.armed) return undefined;
+    // dsh disarms on agent errors so a failing run cannot burn the round budget.
+    if (e.outcome === "error") { disarmGoal(); safeNotify(ctx, "Goal disarmed: the run ended with an error. /goal resume to continue.", "warning"); return undefined; }
+    if (e.outcome !== "completed" || ctx.hasPendingMessages()) return undefined;
+    if (subagents.hasLive(owner) || jobs.hasRunning(owner)) return undefined;
     if (goal.roundsStarted >= goal.maxGoalRounds) {
       goal.status = "blocked"; goal.blocker = `round-limit: reached ${goal.maxGoalRounds} rounds`; goal.armed = false; goal.revision++;
-      persistGoal(); notify("Goal reached its round limit and was blocked.", "pi-dsh/goal"); return;
+      persistGoal(); notify("Goal reached its round limit and was blocked.", "pi-dsh/goal"); return undefined;
     }
-    if (pendingGoalRound !== undefined) return;
     pendingGoalRound = goal.roundsStarted + 1;
-    pi.sendUserMessage(renderGoalRound(goal, pendingGoalRound));
+    humanTurn = false;
+    return { continue: true, entries: [{ type: "custom_message", customType: "pi-dsh/goal-round", content: renderGoalRound(goal, pendingGoalRound), display: true }] };
+  });
+  pi.on("agent_settled", async (e: any, ctx: any) => {
+    remember(ctx); humanTurn = false;
+    const wasRoundRun = goalRoundRun; goalRoundRun = false;
+    const unstarted = pendingGoalRound; pendingGoalRound = undefined;
+    if (!goal || goal.status !== "active" || !goal.armed) return;
+    if (e.aborted) {
+      // An aborted round pauses the goal; an aborted human turn only removes automatic authority (dsh).
+      disarmGoal(wasRoundRun ? "paused" : undefined);
+      safeNotify(ctx, `Goal ${wasRoundRun ? "paused" : "disarmed"}: the run was aborted. /goal resume to continue.`, "warning");
+    } else if (unstarted !== undefined) {
+      // A requested round that never reached its first turn must not stay half-counted.
+      goal.status = "blocked"; goal.blocker = `queue-failed: round ${unstarted} never started`; goal.armed = false; goal.revision++;
+      persistGoal(); safeNotify(ctx, "Goal blocked: its next round could not start.", "error");
+    }
   });
 
   // ---- PTC run_code ----

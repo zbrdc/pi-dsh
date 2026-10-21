@@ -4,6 +4,10 @@ All notable changes to pi-dsh will be documented in this file.
 
 ## Unreleased
 
+- Goal driver: rounds are admitted at Pi's `agent_before_settle` boundary as a continuation of the running run, replacing the settled-time synthetic user message. Escape now stops the loop (an aborted round pauses the goal; an aborted human turn disarms it), `/goal pause` aborts the live turn, an errored run disarms the goal, and a round that never starts blocks it instead of staying half-counted. Human authority no longer carries from the starting prompt into later rounds.
+- Subagents: children honor the standing `sandboxMode` (a confined foreground `bash` under `read-only`/`workspace-write`, fail-closed like the parent's); previously `read-only` did not constrain children. `structured_output` ends a child run with `terminate: true` instead of a 200 ms poll plus abort; a mixed tool batch closes at the turn boundary.
+- Tests: integration suites run the extension inside a real Pi session against pi-ai's scripted faux provider (`tests/goal.integration.test.ts`, `tests/subagent.integration.test.ts`).
+
 - Standing rules: `rules_write` (whole-list replace, max 20 × 400 chars) and `/rules` persist durable user instructions as session entries and carry them in the control section, so they survive compaction by extractive compactors such as pi-vcc. A pi-dsh addition with no DSH tool equivalent.
 - UI: goal, todos, jobs, and agents/terminals/team now share one side-by-side panel widget in the TUI (columns sized to content, wrapping into rows on narrow terminals) instead of four stacked widgets, leaving more room for output. RPC mode keeps the stacked string widgets. Declares `@earendil-works/pi-tui` as a peer dependency.
 - Subagents in depth, modeled on DSH `dsh-subagent` + experimental agent-team:
