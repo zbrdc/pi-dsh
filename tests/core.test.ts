@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateRules, MAX_RULES, MAX_RULE_CHARS, validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs, resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, tmuxSessionName, tmuxSendKeysChunks, parseOutputSchema } from "../src/core.ts";
+import { validateRules, MAX_RULES, MAX_RULE_CHARS, validateTodos, RepeatTracker, spillText, pruneText, assertLosslessJson, OutputRing, newGoal, applyBlocker, generateSdk, canonical, normalizeStructured, captureStructuredSubmission, renderTaskControlSection, jsonSchemaToTs, Semaphore, completedTurnCut, bwrapArgs, resolveToolTimeoutMs, timeoutFieldCaps, fuseSignal, ToolWatchdog, tmuxSessionName, tmuxSendKeysChunks, parseOutputSchema, modelRouteAllowed, roundFenceFailure, roundKey } from "../src/core.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { JobRegistry } from "../src/jobs.ts";
 import { capLines, layoutColumns, renderAgentsWidget, renderDashboard, renderJobsWidget, renderStatusLine, renderTodoWidget } from "../src/ui.ts";
@@ -141,6 +141,18 @@ test("fork cut and bwrap args", () => {
   assert.equal(completedTurnCut([{ role: "user" }]), 0);
   assert.ok(bwrapArgs("workspace-write", "/w").join(" ").includes("--bind /w /w"));
   assert.deepEqual(bwrapArgs("danger-full-access", "/w"), []);
+});
+
+test("bwrap mounts the root first and layers /proc, /dev and /tmp over it, with the workspace last", () => {
+  for (const mode of ["read-only", "workspace-write"] as const) {
+    const args = bwrapArgs(mode, "/w");
+    const at = (flag: string, value?: string) => args.findIndex((a, i) => a === flag && (value === undefined || args[i + 1] === value));
+    assert.ok(at("--ro-bind", "/") < at("--proc") && at("--proc") < at("--dev"), "a mount placed before the root bind is covered by it");
+    assert.ok(at("--dev") < at("--tmpfs"), "tmpfs after dev");
+    assert.ok(at("--tmpfs") < args.indexOf("/w"), "the workspace is bound after /tmp so a workspace under /tmp stays visible");
+    assert.equal(args[args.indexOf("/w") - 1], mode === "workspace-write" ? "--bind" : "--ro-bind");
+    assert.deepEqual(args.slice(-3), ["--chdir", "/w", "--"]);
+  }
 });
 
 test("ptc persistent retains let/const across await evaluations", async () => {
@@ -533,4 +545,25 @@ test("parseOutputSchema accepts object and stringified schema (live regression)"
   assert.throws(() => parseOutputSchema("{not json"), /not valid JSON/);
   assert.throws(() => parseOutputSchema('"just a string"'), /must be a JSON Schema object/);
   assert.throws(() => parseOutputSchema([1, 2]), /must be a JSON Schema object/);
+});
+
+test("modelRouteAllowed: no allowlist allows every route, a list allows only its entries", () => {
+  assert.equal(modelRouteAllowed("a/x", undefined), true);
+  assert.equal(modelRouteAllowed("a/x", []), true);
+  assert.equal(modelRouteAllowed("a/x", ["a/x", "b/y"]), true);
+  assert.equal(modelRouteAllowed("a/z", ["a/x", "b/y"]), false);
+  assert.equal(modelRouteAllowed("x", ["a/x"]), false, "a bare id is not a route");
+});
+
+test("roundFenceFailure: a round owns the goal only while id, revision, state, and round number all match", () => {
+  const goal = { id: "g1", revision: 3, objective: "o", status: "active" as const, roundsStarted: 1, maxGoalRounds: 5, blockerRounds: 0, armed: true };
+  const round = { goalId: "g1", revision: 3, round: 2 };
+  assert.equal(roundFenceFailure(goal, round), undefined);
+  assert.match(roundFenceFailure(undefined, round) ?? "", /cleared/);
+  assert.match(roundFenceFailure({ ...goal, id: "g2" }, round) ?? "", /replaced/);
+  assert.match(roundFenceFailure({ ...goal, revision: 4 }, round) ?? "", /changed/);
+  assert.match(roundFenceFailure({ ...goal, armed: false }, round) ?? "", /armed/);
+  assert.match(roundFenceFailure({ ...goal, status: "paused" }, round) ?? "", /armed/);
+  assert.match(roundFenceFailure({ ...goal, roundsStarted: 2 }, round) ?? "", /already started/);
+  assert.equal(roundKey(round), "g1:3:2");
 });

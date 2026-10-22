@@ -19,6 +19,10 @@ test("goal rounds chain after the human turn until the round limit blocks the go
   assert.equal(h.faux.state.callCount, 5);
   assert.equal(h.goal().status, "blocked");
   assert.match(h.goal().blocker, /round-limit/);
+  // Each round prompt is stamped with the goal and revision it was requested under.
+  const rounds = (h.session.sessionManager.getBranch() as any[]).filter((e) => e.type === "custom_message" && e.customType === "pi-dsh/goal-round");
+  assert.deepEqual(rounds.map((e) => e.details.round), [1, 2]);
+  assert.ok(rounds.every((e) => e.details.goalId === h.goal().id && Number.isInteger(e.details.revision)));
 });
 
 test("aborting a goal round pauses the goal and starts no further round", async (t) => {

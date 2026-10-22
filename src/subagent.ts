@@ -4,9 +4,8 @@
  * further up to maxDepth, can message adjacent agents (direct parent/children,
  * or any team member), and teammates share the durable team task board.
  * Capacity counts live activations across the whole tree, as in dsh. */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { Type } from "typebox";
@@ -14,6 +13,8 @@ import { RepeatTracker, captureStructuredSubmission, completedTurnCut, normalize
 import { renderTeamTask, type TeamBoard, type TeamTaskAction } from "./team.ts";
 import { createSandboxedBash, isRestrictive, type ChildSandbox } from "./child-bash.ts";
 import { createWorktree, ensureWorktree, removeWorktree, settleWorktree, worktreeCwd, type Worktree } from "./worktree.ts";
+import type { ExternalProvider } from "./external.ts";
+import { agentDir as piAgentDir, piDshDir } from "./paths.ts";
 
 export type StopReason = "completed" | "failed" | "killed" | "timeout" | "interrupted" | "host-exit";
 export interface ActivationResult { childId: string; text: string; data?: unknown; status: "completed" | "failed" | "killed"; stopReason?: StopReason }
@@ -40,7 +41,7 @@ export interface AgentStatus {
   lastText: string; elapsedMs: number;
 }
 
-interface ChildHandle {
+export interface ChildHandle {
   sessionId: string; sessionFile?: string;
   prompt(text: string): Promise<void>;
   steer(text: string): Promise<unknown>;
@@ -63,7 +64,8 @@ export interface CreateChildOpts {
 export type CreateChildFn = (opts: CreateChildOpts) => Promise<ChildHandle>;
 
 export interface StartOptions {
-  provider: "spawn" | "fork"; label: string; task: string; owner: string;
+  /** "spawn" and "fork" run a Pi child; any other name selects a configured external provider. */
+  provider: string; label: string; task: string; owner: string;
   cwd: string; model?: unknown; modelLabel?: string; thinkingLevel?: string;
   parentId?: string; depth?: number; role?: SubagentRole; name?: string; preset?: string;
   /** Fork seed: parent messages already cut at the last completed turn. */
@@ -108,6 +110,8 @@ export class SubagentManager {
     worktreeRoot?: string;
     /** Resolve a persisted model route label back to a live model (cold resume). */
     resolveModel?: (label: string) => unknown;
+    /** External agent products by provider name (see external.ts); their runs are one-shot and not continuable. */
+    externalProviders?: Record<string, ExternalProvider>;
   };
   constructor(opts: SubagentManager["opts"] = {}) { this.opts = opts; }
 
@@ -115,7 +119,7 @@ export class SubagentManager {
   get maxDepth(): number { return this.opts.maxDepth ?? 1; }
   private createChild(): CreateChildFn { return this.opts.createChild ?? createSdkChild; }
   private childDir(): string {
-    const dir = this.opts.childDir ?? join(homedir(), ".pi", "agent", "pi-dsh", "children");
+    const dir = this.opts.childDir ?? piDshDir("children");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -230,11 +234,12 @@ export class SubagentManager {
       label: opts.label, cwd, model: opts.model, modelLabel: opts.modelLabel,
       thinkingLevel: opts.thinkingLevel, preset: opts.preset,
     };
-    const extraTools = this.buildChildTools(identity, pending);
-    const toolNames = [...new Set([...builtinTools, "structured_output", ...extraTools.map((t) => t.name)])];
+    const external = this.opts.externalProviders?.[opts.provider];
+    const extraTools = external ? [] : this.buildChildTools(identity, pending);
+    const toolNames = external ? [] : [...new Set([...builtinTools, "structured_output", ...extraTools.map((t) => t.name)])];
     let handle: ChildHandle;
     try {
-      handle = await this.createChild()({
+      handle = external ? createExternalChild(external, { cwd }) : await this.createChild()({
         cwd, model: opts.model, thinkingLevel: opts.thinkingLevel, tools: toolNames,
         systemAppend, childDir: this.childDir(),
         seedMessages: opts.provider === "fork" ? opts.seedMessages : undefined,
@@ -250,8 +255,8 @@ export class SubagentManager {
     const entry: CatalogEntry = {
       childId: handle.sessionId, provider: opts.provider, label: opts.label, owner: opts.owner,
       parentId, depth, role: pending.role, name: opts.name,
-      sessionFile: handle.sessionFile, cwd, createdAt: Date.now(), status: "live", continuable: true,
-      modelLabel: opts.modelLabel, thinkingLevel: opts.thinkingLevel, preset: opts.preset, tools: toolNames,
+      sessionFile: handle.sessionFile, cwd, createdAt: Date.now(), status: "live", continuable: !external,
+      modelLabel: opts.modelLabel, thinkingLevel: opts.thinkingLevel, preset: opts.preset, ...(external ? {} : { tools: toolNames }),
       toolCalls: 0, turns: 0, ...(worktree ? { worktree } : {}),
     };
     let resolveResult: (r: ActivationResult) => void = () => undefined;
@@ -267,7 +272,9 @@ export class SubagentManager {
     this.watch(activation);
     this.onCatalog?.(entry);
     this.emitChange();
-    void this.run(activation, opts.task, opts.timeoutMs ?? this.opts.defaultTimeoutMs);
+    // An external product has no system prompt of ours, so the worktree note rides in the task.
+    const task = external && worktree ? `${isolationNote(worktree)}\n\n${opts.task}` : opts.task;
+    void this.run(activation, task, opts.timeoutMs ?? this.opts.defaultTimeoutMs);
     return entry.childId;
   }
 
@@ -693,7 +700,7 @@ function createChildPolicyExtension(): (pi: any) => void {
       if (e.toolName === "read" || e.toolName === "edit" || e.toolName === "write") await observe(ctx, e);
       const joined = (e.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
       if (joined.length <= 50_000 || e.isError) return undefined;
-      const dir = join(homedir(), ".pi", "agent", "pi-dsh", "spill", "children");
+      const dir = piDshDir("spill", "children");
       const file = join(dir, `${String(e.toolCallId).replace(/[^A-Za-z0-9_-]/g, "_")}.txt`);
       try { mkdirSync(dir, { recursive: true }); writeFileSync(file, joined, "utf8"); }
       catch { return undefined; }
@@ -720,6 +727,40 @@ function createChildPolicyExtension(): (pi: any) => void {
 }
 
 /** Test seam: callers may supply the model runtime a child session resolves providers from. */
+/** A ChildHandle over an external product: one prompt runs the whole task, and nothing can be sent into it afterwards. */
+export function createExternalChild(provider: ExternalProvider, opts: { cwd: string }): ChildHandle {
+  const controller = new AbortController();
+  const listeners = new Set<(event: any) => void>();
+  const emit = (event: object) => { for (const listener of [...listeners]) listener(event); };
+  const refuse = async (): Promise<never> => { throw new Error(`${provider.product} subagents accept no follow-up input`); };
+  let running = false;
+  let text = "";
+  return {
+    sessionId: `ext-${provider.name}-${randomUUID()}`,
+    async prompt(task: string) {
+      running = true;
+      emit({ type: "turn_start" });
+      try {
+        text = await provider.run({
+          task, cwd: opts.cwd, signal: controller.signal,
+          onActivity: (name, detail) => { emit({ type: "tool_execution_start", toolName: name, args: { command: detail } }); emit({ type: "tool_execution_end", toolName: name }); },
+        });
+      } catch (error) {
+        // The safe diagnostic is the answer the parent sees for a failed run.
+        text = (error as { diagnostic?: string }).diagnostic ?? "";
+        throw error;
+      } finally { running = false; }
+    },
+    steer: refuse, followUp: refuse,
+    abort: async () => { controller.abort(); },
+    isStreaming: () => running,
+    lastText: () => text,
+    structured: () => undefined,
+    subscribe(listener: (event: any) => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    dispose() { controller.abort(); },
+  };
+}
+
 export interface SdkChildOverrides { modelRuntime?: unknown }
 
 export async function createSdkChild(opts: CreateChildOpts, overrides: SdkChildOverrides = {}): Promise<ChildHandle> {
@@ -736,7 +777,7 @@ export async function createSdkChild(opts: CreateChildOpts, overrides: SdkChildO
       return { content: [{ type: "text", text: "Structured result recorded." }], details: {}, terminate: true };
     },
   };
-  const agentDir = sdk.getAgentDir ? sdk.getAgentDir() : join(homedir(), ".pi", "agent");
+  const agentDir = sdk.getAgentDir ? sdk.getAgentDir() : piAgentDir();
   const loader = new sdk.DefaultResourceLoader({
     cwd: opts.cwd, agentDir, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
     appendSystemPrompt: [buildChildPrompt({ ...opts.prompt, requireStructured: opts.requireStructured, systemAppend: opts.systemAppend ?? opts.prompt?.systemAppend })],

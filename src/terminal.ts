@@ -321,6 +321,23 @@ function cleanEcho(out: string, command: string, marker: string): string {
   return out.split("\n").filter((l) => !l.includes(marker) && l.trim() !== command.trim() && !l.includes(`echo ${marker}`)).join("\n").replace(/\r/g, "").trim();
 }
 
+/** Pids in process group `pgid` other than `except`, read from /proc; undefined where /proc is not available. */
+function groupMembers(pgid: number, except: number): number[] | undefined {
+  let names: string[];
+  try { names = readdirSync("/proc"); } catch { return undefined; }
+  const members: number[] = [];
+  for (const name of names) {
+    if (!/^\d+$/.test(name) || Number(name) === except) continue;
+    try {
+      // stat is "pid (comm) state ppid pgrp ..."; comm may hold spaces and parentheses, so split after the last ")".
+      const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (Number(fields[2]) === pgid) members.push(Number(name));
+    } catch { /* exited while scanning */ }
+  }
+  return members;
+}
+
 /** One-shot bash as a job-friendly spawn: resolves on exit, streams into the ring, honors the job signal.
  * With a sandbox mode, the shell runs under bubblewrap (root read-only, workspace per mode). */
 export function runShellJob(opts: {
@@ -329,6 +346,8 @@ export function runShellJob(opts: {
   outFile?: string; exitFile?: string;
   /** Operator-asserted bwrap-compatible runner prefix (dsh sandbox-local runnerCommand). */
   sandboxRunner?: string[];
+  /** How long a cancelled job gets between SIGTERM and SIGKILL to clean up. */
+  killGraceMs?: number;
 }): Promise<{ exitCode: number | null }> {
   return new Promise((resolve, reject) => {
     const shell = opts.shell ?? "bash";
@@ -345,12 +364,32 @@ export function runShellJob(opts: {
       ? spawn(runner[0] as string, [...runner.slice(1), ...bwrapArgs(opts.sandboxMode as SandboxMode, opts.cwd), shell, "-c", command], { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], detached: true })
       : spawn(shell, ["-c", command], { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
     opts.onSpawn?.(proc);
-    const killTree = () => { try { if (proc.pid) process.kill(-proc.pid, "SIGKILL"); } catch { proc.kill("SIGKILL"); } };
-    const onAbort = () => killTree();
-    if (opts.signal.aborted) killTree(); else opts.signal.addEventListener("abort", onAbort, { once: true });
+    const signalTree = (sig: NodeJS.Signals) => { try { if (proc.pid) process.kill(-proc.pid, sig); } catch { proc.kill(sig); } };
+    // bwrap exits on SIGTERM and takes the sandbox down with it, so a group-wide SIGTERM races the job's own handler.
+    // Ask only the processes inside the sandbox to stop, and let bwrap end when they do.
+    const askToStop = () => {
+      const inside = sandboxed && proc.pid ? groupMembers(proc.pid, proc.pid) : undefined;
+      if (!inside?.length) { signalTree("SIGTERM"); return; }
+      for (const pid of inside) { try { process.kill(pid, "SIGTERM"); } catch { /* exited */ } }
+    };
+    // Cancel with SIGTERM so the job can release locks and temp files, then SIGKILL whatever is left (dsh jobs-local).
+    let cancelled = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      cancelled = true;
+      askToStop();
+      killTimer = setTimeout(() => signalTree("SIGKILL"), opts.killGraceMs ?? 3000);
+      killTimer.unref?.();
+    };
+    const release = () => {
+      clearTimeout(killTimer);
+      opts.signal.removeEventListener("abort", onAbort);
+      if (cancelled) signalTree("SIGKILL"); // sweep stragglers that outlived the shell
+    };
+    if (opts.signal.aborted) onAbort(); else opts.signal.addEventListener("abort", onAbort, { once: true });
     proc.stdout?.on("data", (d: Buffer) => opts.append(d.toString("utf8")));
     proc.stderr?.on("data", (d: Buffer) => opts.append(d.toString("utf8")));
-    proc.once("error", (e) => { opts.signal.removeEventListener("abort", onAbort); reject(e); });
-    proc.once("exit", (code) => { opts.signal.removeEventListener("abort", onAbort); resolve({ exitCode: code }); });
+    proc.once("error", (e) => { release(); reject(e); });
+    proc.once("exit", (code) => { release(); resolve({ exitCode: code }); });
   });
 }

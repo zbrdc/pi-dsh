@@ -170,6 +170,30 @@ export function renderGoalRound(goal: Goal, round: number): string {
   return `<goal_round>\nObjective: ${JSON.stringify(goal.objective)}\nRound: ${round}/${goal.maxGoalRounds}\n\nContinue working toward the objective in this same session. Treat the current workspace, tool results, and durable session state as authoritative; inspect them instead of assuming earlier narration is still current. Make concrete progress and verify the result. Before claiming completion, gather evidence that the whole objective is achieved, read the current goal with get_goal, and call update_goal to mark it complete (an auditor will verify). If work remains, leave the goal active for the next round. Report a blocker only with a concrete blocker string.\n</goal_round>`;
 }
 
+/** Whether a provider/modelId route may be chosen for a child: an empty or absent allowlist allows every route (dsh ModelSelectionPolicy). */
+export const modelRouteAllowed = (label: string, allowlist: readonly string[] | undefined): boolean =>
+  allowlist === undefined || allowlist.length === 0 || allowlist.includes(label);
+
+/** Identity a goal round carries from the moment it is requested (dsh goal-round-driver RoundIdentity). */
+export interface RoundIdentity { goalId: string; revision: number; round: number }
+export const roundKey = (r: RoundIdentity): string => `${r.goalId}:${r.revision}:${r.round}`;
+
+/** Why a requested round may not start, or undefined when it still owns the goal (dsh validReservation).
+ * Every goal mutation bumps the revision, so a round asked for before a pause, edit, or replacement fails here. */
+export function roundFenceFailure(goal: Goal | undefined, round: RoundIdentity): string | undefined {
+  if (!goal) return "the goal was cleared";
+  if (goal.id !== round.goalId) return "the goal was replaced";
+  if (goal.revision !== round.revision) return "the goal changed";
+  if (goal.status !== "active" || !goal.armed) return "the goal is no longer armed";
+  if (round.round !== goal.roundsStarted + 1) return "another round already started";
+  return undefined;
+}
+
+/** Stands in for a withdrawn round prompt so the model does not act on instructions that no longer hold. */
+export function withdrawnRoundNotice(round: number, reason: string): string {
+  return `<goal_round_withdrawn>\nGoal round ${round} was withdrawn before it started: ${reason}. Do not continue the earlier goal work on this prompt's authority. Wait for the user's next instruction; a new round arrives by itself if the goal is still active.\n</goal_round_withdrawn>`;
+}
+
 /** Parse an output_schema argument: models often pass the schema as a JSON
  * string instead of an object (observed live). Returns the schema object,
  * undefined when absent, and throws on anything else. */
@@ -419,12 +443,16 @@ export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access"
 export const SANDBOX_ORDER: SandboxMode[] = ["read-only", "workspace-write", "danger-full-access"];
 /** Bubblewrap argv prefix confining a command. Caller appends the real argv.
  * Root is bound read-only so host toolchains stay usable; only the workspace
- * (workspace-write) is writable. Network is not unshared. */
+ * (workspace-write) is writable. Network is not unshared.
+ *
+ * Order matters: bwrap applies mounts in sequence, so the host root goes first and /proc, /dev and /tmp are
+ * layered over it. Put them before the root bind and the root covers them: /proc is then the host's under a
+ * new pid namespace (Bun segfaults on it) and /tmp is not private. The workspace is bound after /tmp so a
+ * workspace under /tmp stays visible. */
 export function bwrapArgs(mode: SandboxMode, cwd: string): string[] {
   if (mode === "danger-full-access") return [];
-  const args = ["--die-with-parent", "--unshare-pid", "--proc", "/proc", "--dev", "/dev",
-    "--tmpfs", "/tmp", "--ro-bind", "/", "/"];
-  if (mode === "workspace-write") args.push("--bind", cwd, cwd);
+  const args = ["--die-with-parent", "--unshare-pid", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"];
+  args.push(mode === "workspace-write" ? "--bind" : "--ro-bind", cwd, cwd);
   args.push("--chdir", cwd, "--");
   return args;
 }

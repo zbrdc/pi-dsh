@@ -16,7 +16,7 @@ Pi-dsh is a semantic reimplementation for Pi APIs, not a line-by-line source por
 | Standing rules | `rules_write`, `/rules` — durable user instructions re-injected after every compaction (pi-dsh addition) | agent-instructions (closest) |
 | Guards | repeat-call reminders (3/5/8), timeout input caps on all tools, per-tool deadlines (`toolTimeoutMs`): fused signals for nested calls, top-level watchdog → `TOOL_TIMEOUT`; read-before-edit + stale-version FS policy, `read_image` | guard/*, fs-observation-policy, tool-fs |
 | Context | spill to file + locator; tool-result pruner that stores `context_edit` entries once the context passes `pruneAtContextPercent` (older oversized results cut to head and tail, images moved to disk; the newest six results stay whole) | spill-policy, compaction-tool-result-pruner |
-| Jobs | `job_output/list/kill`, owned `bash` (background promotion, bwrap sandbox + escalation approval), durable output files, completion wakes with caps | jobs, tool-jobs, tool-bash, sandbox-policy |
+| Jobs | `job_output/list/kill`, owned `bash` (background promotion, bwrap sandbox + escalation approval), durable output files, completion wakes with caps, SIGTERM-then-SIGKILL cancellation that records why | jobs, tool-jobs, tool-bash, sandbox-policy |
 | Terminals | `terminal_open/send/read/list/close/signal/resize`, `bash_persistent`, `pwsh(_persistent)` when a binary exists; `durable: true` runs in detached tmux and reattaches after a Pi restart | terminal, tool-terminal, tool-bash-persistent |
 | UI | widgets for goal, todos, jobs, agents/terminals/team + combined status line; `/dsh` dashboard, `/todos`, `/jobs` (kill), `/agents`, `/terminals` (close) | client/ui-goal, ui-jobs, ui-subagent, ui-plan |
 | Subagents | `subagent`, `subagent_fork` (explicit completed-turn seed) with per-child `model`, `thinking_level`, `preset`, `timeout_ms`, `output_schema`; `send_message` (adjacent, both directions, messageIds), `interrupt_agent`, `list_agents` (children/descendants), `agent_status`, `list_subagent_models`; capacity 8/tree, depth cap (`maxSubagentDepth`), cold resume after restart, `isolation: "worktree"` (own git checkout and branch; an untouched one is removed when the child settles, otherwise the completion notice says how to review, merge, or discard it); teams: `spawn_teammate`, `wait_agent` (settle or next team change), CAS `team_task_*` board visible to teammates | subagent, spawn/fork, tool-subagent(-control), experimental agent-team |
@@ -31,7 +31,9 @@ Subagents in depth: capacity is 8 live activations across the whole session tree
 
 Teams (DSH experimental agent-team shape): `spawn_teammate` creates a permanently named teammate (fresh or forked; failed provisioning keeps the name as a `failed` roster entry). Teammates share the workspace and receive the same team tools as the lead, scoped to their identity: peer `send_message` by name, roster via `list_agents`, and the durable task board. Board tasks are versioned snapshots updated compare-and-set (`TEAM_TASK_STALE_REVISION` on a stale write), claimable only when their `blockedBy` dependencies are complete, with advisory `writeScopes` overlap warnings between in-progress tasks. `wait_agent` with no target waits for the next team change instead of polling. Only the lead spawns or interrupts teammates.
 
-PTC backends: Node (default) runs model code in a child process, optionally under bubblewrap; Python (`backend: "python"`) runs statements in CPython (assign `result`, call `tools.<name>(dict)`); Mossbed (`backend: "mossbed"`) runs JS in the tardigrade sandbox. On every backend `tools.*` re-enters pi through `ctx.executeTool` (for mossbed, through a per-run loopback bridge granted to the guest by name only — the URL and token stay operator-side; results over ~900 KB exceed the net budget and must be narrowed). Persistent Node mode (`persistentPtc`) retains top-level declarations across calls; redeclarating a `const` fails.
+PTC backends: Node (default) runs model code in a child process, optionally under bubblewrap; Python (`backend: "python"`) runs statements in CPython (assign `result`, call `tools.<name>(dict)`); Mossbed (`backend: "mossbed"`) runs JS in the tardigrade sandbox. On every backend `tools.*` re-enters pi through `ctx.executeTool` (for mossbed, through a per-run loopback bridge granted to the guest by name only — the URL and token stay operator-side; results over ~900 KB exceed the net budget and must be narrowed). Persistent Node mode (`persistentPtc`) retains top-level declarations across calls; redeclarating a `const` fails. Programs are bounded as in DSH: combined logs plus return value may not exceed `ptcMaxOutputBytes` (64 MiB; the run fails with `output-limit` and a persistent process is dropped), no more than `ptcMaxPendingCalls` (128) binding calls may be in flight, and their arguments may not exceed `ptcMaxMessageBytes`. A crashed child reports its exit status and stderr tail. The Python backend runs under the same bubblewrap profile as Node, so the standing `sandboxMode` applies whichever backend is chosen.
+
+Workflow scripts run under the standing `sandboxMode` and never get an escalation. `pipeline` sends each item through its own stage chain with no barrier between stages, and a stage receives `(value, originalItem, index)`. A failed child or an ordinary error inside one item makes that item `null`; a bad argument, an unknown preset or model, a call over `workflowMaxItemsPerCall` (4096), or an agent total over `workflowMaxAgents` (1000) ends the script with an error. A script that ends early (an error or Escape) interrupts the children it started.
 
 Sandbox: `sandboxMode` is the standing mode for `bash`, Node `run_code`, and subagent children's `bash` — `read-only` (root read-only), `workspace-write`, or `danger-full-access` (default, matching stock pi). A call may request a wider mode per call with `sandbox_permissions` plus a `justification`; widening requires interactive approval and is denied headless. Restricted modes require bubblewrap (or a custom bwrap-compatible runner via `sandboxRunnerCommand`), are functionally probed once, and fail closed without a usable runner. DSH's SSH and Windows-ACL sandboxes are not applicable here: pi-dsh has no SSH transport to confine, and it is Linux-only (see `dsh-compat.json`).
 
@@ -72,7 +74,7 @@ Restart Pi after installing or updating the package. Extension code runs locally
 
 ## Configuration
 
-Optional config at `~/.pi/agent/pi-dsh.json` (defaults shown). A starter file is included as `pi-dsh.example.json`:
+Optional config at `~/.pi/agent/pi-dsh.json` (under `$PI_CODING_AGENT_DIR` when that is set) (defaults shown). A starter file is included as `pi-dsh.example.json`:
 
 ```json
 {
@@ -100,9 +102,36 @@ Optional config at `~/.pi/agent/pi-dsh.json` (defaults shown). A starter file is
   "subagentModels": null,
   "subagentPresets": null,
   "maxTeamMembers": 16,
-  "maxTeamTasks": 256
+  "maxTeamTasks": 256,
+  "jobKillGraceMs": 3000,
+  "ptcGraceMs": 3000,
+  "ptcMaxOutputBytes": 67108864,
+  "ptcMaxPendingCalls": 128,
+  "ptcMaxMessageBytes": 134217728,
+  "workflowMaxAgents": 1000,
+  "workflowMaxItemsPerCall": 4096,
+  "workflowSyncTimeoutMs": 5000,
+  "externalSubagents": null
 }
 ```
+
+### External subagents
+
+`externalSubagents` delegates a task to another agent product. Each entry adds a `subagent_<name>` tool, and nothing is registered until you configure one, because these products run on their own account and credits:
+
+```json
+{
+  "externalSubagents": {
+    "claude-code": { "model": "sonnet", "permissionMode": "dontAsk" },
+    "codex": { "permission": "never", "env": { "OPENAI_API_KEY": "..." } },
+    "opencode": { "type": "acp", "command": "opencode", "args": ["acp"], "permission": "reject", "writablePaths": ["~/.local/share/opencode"] }
+  }
+}
+```
+
+A run is one unattended session in the workspace (as in DSH): the task goes in, and the final answer or a fixed-shape failure line such as `Product subagent failure (product: Codex; stage: run; category: process; exit code: 3)` comes back as a completion notice. Reasoning, tool traffic and stderr stay out of the session, the run accepts no follow-up input and cannot be resumed after a restart, and `agent_status`, `wait_agent`, `interrupt_agent`, `timeout_ms` and `isolation: "worktree"` work as for any child. Ambient variables whose names contain `KEY`, `PASSWORD`, `SECRET` or `TOKEN` are removed from the product's environment; put an API key in the entry's `env`, or log the product in beforehand.
+
+Choosing a provider never widens access. Codex receives the standing `sandboxMode` as its own `--sandbox`. Under `read-only` and `workspace-write`, Claude Code is limited to file tools (`Read`, `Grep`, `Glob`, plus `Edit`, `Write` and `NotebookEdit` under `workspace-write`) with no command tools, no MCP servers and no skills, and `workspace-write` defaults its `permissionMode` to `acceptEdits` because `dontAsk` denies edits; under `danger-full-access` it runs with your own Claude Code settings, MCP servers and hooks. A setting wider than the sandbox (`bypassPermissions`, `auto`, `acceptEdits`, Codex `approve-for-me` or `dangerously-bypass-approvals-and-sandbox`) is refused before the product starts. An ACP agent has no sandbox of its own, so it runs under bubblewrap; list the directories it keeps state in under `writablePaths` (`~` expands, missing directories are created). ACP `permission` answers only the permission requests the agent chooses to make, so an agent that edits without asking is held back by the sandbox, not by `permission: "reject"`. Claude Code was exercised end to end against the real CLI (2.1.306) driven by GLM through a Z.ai plan, and the ACP path against a real `opencode acp`; Codex was exercised against the real binary with a local stand-in model server. Run one real task per product on your own account before relying on it.
 
 Set `ptcOnly: true` and disable pi codemode to make `run_code` the single transport (direct tools stay callable inside programs; model-only orchestrators stay declared). With codemode on, both transports are available.
 
@@ -118,11 +147,11 @@ Mossbed isolates pure JS/WASM compute, but its optional bridge intentionally let
 
 - Deadlines are cooperative, exactly as in DSH (its timeout-policy cannot hard-stop a tool that ignores `exec.signal` either). The remaining Pi-specific gap: an extension cannot swap the abort signal of a single model-issued foreign call, so a top-level watchdog abort ends the turn rather than only that call. Nested `run_code` calls do get per-call deadline signals.
 - Non-durable PTY shells die with the Pi process; only their transcripts survive. Use `terminal_open` with `durable: true` (tmux) for terminals that must outlive Pi.
-- In print/json mode there is no dialog surface: `exit_plan_mode` auto-approves and sandbox widening is denied. `/plan <task>` itself works — the task is persisted and injected into the next turn. Print mode also exits when the parent turn ends, so fire-and-forget subagents are aborted at shutdown unless the parent collects them with `wait_agent` (or runs them through `workflow`) before finishing; completion notices need a live (interactive) session.
+- In print/json mode there is no dialog surface: sandbox widening is denied and `exit_plan_mode` cannot be approved, so plan mode stays on, the model presents the plan as its reply, and the user leaves with `/plan off`. `/plan <task>` itself works — the task is persisted and injected into the next turn. Print mode also exits when the parent turn ends, so fire-and-forget subagents are aborted at shutdown unless the parent collects them with `wait_agent` (or runs them through `workflow`) before finishing; completion notices need a live (interactive) session.
 - UI is status + text widgets and notify dashboards, not DSH's web panels. Pi's extension API has no richer persistent panel surface.
 - Sandbox is bubblewrap(-compatible) only on Linux; DSH's Landlock fallback runner, SSH sandbox (no SSH transport exists here), and Windows ACL runner are not ported.
 - Persistent PTC declarations in a `return`-style evaluation do not outlive that call (write declarations without `return` to keep them).
-- External subagent providers (Claude Code, Codex, ACP) are not ported; children always run through the Pi SDK. Child `bash` honors the standing `sandboxMode` through a confined foreground bash (no owned background jobs or per-call escalation inside children; under `danger-full-access` it is stock Pi bash), presets are pi-dsh config objects rather than full Pi profiles, and `interrupt_agent` waits for the turn to settle instead of returning on acceptance. Children share the workspace with no worktree isolation — the board's write-scope warnings are advisory, as in DSH.
+- External subagent providers (Claude Code, Codex, ACP) are opt-in through `externalSubagents` and have only been run against the real products on a small set of tasks; see External subagents. Pi children honor the standing `sandboxMode` through a confined foreground bash (no owned background jobs or per-call escalation inside children; under `danger-full-access` it is stock Pi bash), presets are pi-dsh config objects rather than full Pi profiles, and `interrupt_agent` waits for the turn to settle instead of returning on acceptance. Children share the workspace unless started with `isolation: "worktree"`; the board's write-scope warnings are advisory, as in DSH.
 - `pwsh` tools register only when a pwsh binary exists.
 
 ## Development

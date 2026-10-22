@@ -4,6 +4,10 @@
 // {type:"call-result", callId, ok, value|error}. Completion: {type:"done", runId, ok, value, logs, error?}.
 import vm from "node:vm";
 
+class OutputLimitError extends Error {
+  constructor() { super("program output exceeded the configured limit"); this.name = "OutputLimitError"; }
+}
+
 const pending = new Map();
 let callSeq = 0;
 let context = null;
@@ -67,12 +71,29 @@ process.on("message", async (msg) => {
   }
   if (msg.type !== "run") return;
   const logs = [];
+  const maxOutputBytes = Number.isSafeInteger(msg.maxOutputBytes) && msg.maxOutputBytes > 0 ? msg.maxOutputBytes : Infinity;
+  let outputBytes = 2; // the empty logs array: []
+  let overflowed = false;
+  // Exceeding the cap stops retention at once, so a runaway loop cannot grow the heap; the throw ends a program that does not catch it.
+  const record = (text) => {
+    if (overflowed) throw new OutputLimitError();
+    const cost = Buffer.byteLength(JSON.stringify(text)) + (logs.length > 0 ? 1 : 0);
+    if (outputBytes + cost > maxOutputBytes) { overflowed = true; throw new OutputLimitError(); }
+    outputBytes += cost;
+    logs.push(text);
+    // Streamed as well, so a program stopped by a timeout or abort still reports what it logged.
+    process.send({ type: "log", runId: msg.runId, text });
+  };
   const fakeConsole = {
-    log: (...a) => logs.push(a.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join(" ")),
-    error: (...a) => logs.push(a.map(String).join(" ")),
-    warn: (...a) => logs.push(a.map(String).join(" ")),
+    log: (...a) => record(a.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join(" ")),
+    error: (...a) => record(a.map(String).join(" ")),
+    warn: (...a) => record(a.map(String).join(" ")),
   };
   const ns = makeNamespaces(msg.namespaces ?? {});
+  const outputLimit = () => process.send({
+    type: "done", runId: msg.runId, ok: false, errorKind: "output-limit", logs,
+    error: `outer output exceeded ${maxOutputBytes} bytes`,
+  });
   try {
     let value;
     if (msg.persistent) {
@@ -86,8 +107,12 @@ process.on("message", async (msg) => {
       const fn = new AsyncFunction("console", ...names, `${msg.prelude ?? ""}\n${msg.code}`);
       value = await fn(fakeConsole, ...names.map((n) => ns[n]));
     }
+    if (overflowed) { outputLimit(); return; }
+    const valueBytes = value === undefined ? 0 : Buffer.byteLength(JSON.stringify(value) ?? "null");
+    if (outputBytes + valueBytes > maxOutputBytes) { outputLimit(); return; }
     process.send({ type: "done", runId: msg.runId, ok: true, value: value === undefined ? null : value, logs, valueWasUndefined: value === undefined });
   } catch (err) {
+    if (overflowed || err instanceof OutputLimitError) { outputLimit(); return; }
     process.send({ type: "done", runId: msg.runId, ok: false, error: err instanceof Error ? err.message : String(err), logs });
   }
 });

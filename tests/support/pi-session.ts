@@ -14,7 +14,7 @@ mkdirSync(join(home, ".pi", "agent"), { recursive: true });
 
 const { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } = await import("@earendil-works/pi-ai");
 const sdk = await import("@earendil-works/pi-coding-agent");
-const { default: piDsh } = await import("../../src/index.ts");
+const { createPiDsh } = await import("../../src/index.ts");
 
 export { fauxAssistantMessage, fauxText, fauxToolCall };
 export const scratchHome = home;
@@ -47,7 +47,7 @@ export async function createHarness(options: HarnessOptions = {}) {
   else rmSync(configPath, { force: true });
   const loader = new sdk.DefaultResourceLoader({
     cwd, agentDir, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
-    extensionFactories: [piDsh as any],
+    extensionFactories: [createPiDsh({ childModelRuntime: modelRuntime }) as any],
   });
   await loader.reload();
   const { session } = await sdk.createAgentSession({

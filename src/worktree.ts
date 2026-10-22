@@ -8,9 +8,9 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { piDshDir } from "./paths.ts";
 
 const exec = promisify(execFile);
 
@@ -27,7 +27,7 @@ export interface Worktree {
   removed?: boolean;
 }
 
-export const defaultWorktreeRoot = (): string => join(homedir(), ".pi", "agent", "pi-dsh", "worktrees");
+export const defaultWorktreeRoot = (): string => piDshDir("worktrees");
 
 async function git(cwd: string, args: string[]): Promise<string> {
   const { stdout } = await exec("git", args, { cwd, maxBuffer: 4 * 1024 * 1024 });

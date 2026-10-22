@@ -24,7 +24,12 @@
       "piCommands": [
         "plan",
         "todos"
-      ]
+      ],
+      "gaps": [
+        "Plan approval needs an interactive UI because there is no ask_user_question tool; without one plan mode stays on and /plan off is the only exit.",
+        "Plan mode takes effect at once, where DSH holds a user selection until the next accepted pre-step."
+      ],
+      "notes": "exit_plan_mode fails closed without a UI: plan mode stays on and the plan goes to the user as the reply."
     },
     {
       "area": "Goals",
@@ -43,7 +48,10 @@
       "piCommands": [
         "goal"
       ],
-      "notes": "Rounds are admitted at Pi's agent_before_settle boundary (continue + custom_message) instead of DSH's Agent.followup(); abort pauses an admitted round and disarms otherwise, /goal pause aborts the live turn, error outcomes disarm, and a round that never reaches its first turn blocks the goal (queue-failed). Not ported: DSH's per-round message identity fence (goalId/revision/round) and wrap-up context after complete/blocked."
+      "notes": "Rounds are admitted at Pi's agent_before_settle boundary (continue + custom_message) instead of DSH's Agent.followup(); abort pauses an admitted round and disarms otherwise, /goal pause aborts the live turn, error outcomes disarm, and a round that never reaches its first turn blocks the goal (queue-failed). Each round prompt carries its goalId, revision and round; at the next turn start it must still own the goal (same id and revision, active and armed, next round number, no message from the user waiting) or it is withdrawn: not counted, and replaced by a stand-down notice in every later request. Not ported: wrap-up context after complete/blocked.",
+      "gaps": [
+        "No wrap-up instruction after complete or blocked; the turn simply continues."
+      ]
     },
     {
       "area": "Inbox",
@@ -55,7 +63,11 @@
       "piCommands": [
         "inbox"
       ],
-      "notes": "DSH's agent inbox is a durable projection with next-turn and next-step lanes. pi-dsh keeps its own notices (job/subagent/agent-message/goal/timeout) in a session-entry outbox, drained at Pi's turn_end and agent_before_settle boundaries with coalescing, key-based replacement, and a /inbox view. Not ported: item-level edit and lane transfer, and a durable lane for the user's own steer/follow-up messages, which Pi keeps in memory."
+      "notes": "DSH's agent inbox is a durable projection with next-turn and next-step lanes. pi-dsh keeps its own notices (job/subagent/agent-message/goal/timeout) in a session-entry outbox, drained at Pi's turn_end and agent_before_settle boundaries with coalescing, key-based replacement, and a /inbox view. Not ported: item-level edit and lane transfer, and a durable lane for the user's own steer/follow-up messages, which Pi keeps in memory.",
+      "gaps": [
+        "No item-level edit or lane transfer.",
+        "No durable lane for the user's own steer and follow-up messages, which Pi keeps in memory."
+      ]
     },
     {
       "area": "Standing rules",
@@ -69,7 +81,10 @@
       "piCommands": [
         "rules"
       ],
-      "notes": "A pi-dsh addition. DSH keeps durable user instructions in AGENTS.md (agent-instructions) and in its LLM-written checkpoint ('Critical Context'). pi-vcc compacts algorithmically and can drop a rule list, so rules_write stores them as session entries and re-injects them in the control section after every compaction."
+      "notes": "A pi-dsh addition. DSH keeps durable user instructions in AGENTS.md (agent-instructions) and in its LLM-written checkpoint ('Critical Context'). pi-vcc compacts algorithmically and can drop a rule list, so rules_write stores them as session entries and re-injects them in the control section after every compaction.",
+      "gaps": [
+        "Not a port: DSH keeps durable instructions in AGENTS.md and its LLM-written checkpoint, while rules_write stores a rules list as session entries."
+      ]
     },
     {
       "area": "Guards",
@@ -82,7 +97,10 @@
       "piTools": [
         "read_image"
       ],
-      "notes": "Repeat reminders 3/5/8; read-before-edit + stale-version; tool deadlines: timeout input caps on all tools, fused AbortSignal deadlines for nested executeTool calls, configurable top-level watchdog (toolTimeoutMs) that aborts and stamps TOOL_TIMEOUT. DSH timeout-policy is likewise cooperative (it cannot hard-stop a tool that ignores exec.signal); the residual Pi gap is that a model-issued foreign call's signal cannot be swapped per-call, so top-level enforcement aborts the turn, not just the call."
+      "notes": "Repeat reminders 3/5/8; read-before-edit + stale-version; tool deadlines: timeout input caps on all tools, fused AbortSignal deadlines for nested executeTool calls, configurable top-level watchdog (toolTimeoutMs) that aborts and stamps TOOL_TIMEOUT. DSH timeout-policy is likewise cooperative (it cannot hard-stop a tool that ignores exec.signal); the residual Pi gap is that a model-issued foreign call's signal cannot be swapped per-call, so top-level enforcement aborts the turn, not just the call.",
+      "gaps": [
+        "A top-level tool deadline aborts the turn, not only the call, because Pi cannot swap the signal of a model-issued call."
+      ]
     },
     {
       "area": "Context",
@@ -92,7 +110,11 @@
         "packages/compaction/compaction-tool-result-pruner"
       ],
       "piTools": [],
-      "notes": "Pruning mirrors DSH's persistent, replay-safe tool-result pruner: replacements are stored as Pi context_edit entries at turn_end instead of request-time rewrites. Unlike DSH (which prunes at compaction, every over-budget result), pi-dsh triggers on context-window pressure and leaves the newest six tool results whole; head/tail budgets are 8000 chars per result rather than DSH's 4096+1024."
+      "notes": "Pruning mirrors DSH's persistent, replay-safe tool-result pruner: replacements are stored as Pi context_edit entries at turn_end instead of request-time rewrites. Unlike DSH (which prunes at compaction, every over-budget result), pi-dsh triggers on context-window pressure and leaves the newest six tool results whole; head/tail budgets are 8000 chars per result rather than DSH's 4096+1024.",
+      "gaps": [
+        "Pruning triggers on context pressure and keeps the newest six results whole; DSH prunes every over-budget result at compaction.",
+        "Head and tail budget is 8000 characters per result, not 4096 and 1024."
+      ]
     },
     {
       "area": "Jobs",
@@ -114,7 +136,11 @@
       "piCommands": [
         "jobs"
       ],
-      "notes": "Sandbox: bubblewrap profile + escalation approval + cached functional probe + sandboxRunnerCommand override (DSH runnerCommand). DSH Linux fallback Landlock runner is not ported; bubblewrap only, fails closed."
+      "notes": "Sandbox: bubblewrap profile + escalation approval + cached functional probe + sandboxRunnerCommand override (DSH runnerCommand). DSH Linux fallback Landlock runner is not ported; bubblewrap only, fails closed. A cancelled shell job gets SIGTERM, then SIGKILL after jobKillGraceMs (default 3000), and the settled job records the kill reason.",
+      "gaps": [
+        "No Landlock fallback runner; bubblewrap only.",
+        "A killed job records the caller's reason, not DSH's signal-plus-cause detail."
+      ]
     },
     {
       "area": "Terminals",
@@ -138,7 +164,10 @@
       "piCommands": [
         "terminals"
       ],
-      "notes": "Backends: node-pty, util-linux script, and tmux for durable=true. Durable tmux terminals survive a pi exit and reattach on restore; all terminals persist a transcript, and dead non-durable terminals restore as exited stubs (shell state cannot be resurrected). pwsh tools register only when a binary exists."
+      "notes": "Backends: node-pty, util-linux script, and tmux for durable=true. Durable tmux terminals survive a pi exit and reattach on restore; all terminals persist a transcript, and dead non-durable terminals restore as exited stubs (shell state cannot be resurrected). pwsh tools register only when a binary exists.",
+      "gaps": [
+        "A non-durable terminal's shell state cannot survive a restart; it restores as an exited stub."
+      ]
     },
     {
       "area": "Subagents",
@@ -168,18 +197,31 @@
       "piCommands": [
         "agents"
       ],
-      "notes": "Tree-wide capacity (8), maxSubagentDepth (default 1) with child-visible delegation tools below the cap, adjacent messaging both directions with messageIds, per-child model/thinking/preset selection, timeouts, progress/activity via agent_status, descriptor-persisted catalog (result replay + cold resume after restart), and the agent-team board (CAS revisions, blockedBy readiness, writeScope overlap warnings, wait-for-change) visible to teammates as scoped tools. Deltas: presets are pi-dsh config objects, not DSH preset-registry compositions; interrupt waits for settle instead of returning on acceptance; child bash honors the standing sandboxMode through a confined foreground bash (no owned background jobs in children); team state is one board per root session persisted as session entries. pi-dsh addition with no DSH counterpart: isolation=\"worktree\" (DSH agent-team shares one workspace and offers only advisory writeScopes overlap warnings and no Git controls)."
+      "notes": "Tree-wide capacity (8), maxSubagentDepth (default 1) with child-visible delegation tools below the cap, adjacent messaging both directions with messageIds, per-child model/thinking/preset selection, timeouts, progress/activity via agent_status, descriptor-persisted catalog (result replay + cold resume after restart), and the agent-team board (CAS revisions, blockedBy readiness, writeScope overlap warnings, wait-for-change) visible to teammates as scoped tools. Deltas: presets are pi-dsh config objects, not DSH preset-registry compositions; interrupt waits for settle instead of returning on acceptance; child bash honors the standing sandboxMode through a confined foreground bash (no owned background jobs in children); team state is one board per root session persisted as session entries. pi-dsh addition with no DSH counterpart: isolation=\"worktree\" (DSH agent-team shares one workspace and offers only advisory writeScopes overlap warnings and no Git controls). subagentModels is an allowlist of provider/modelId routes applied to every explicit selection, a preset's or workflow agent's model included, and inheriting the parent's model is never gated (dsh ModelSelectionPolicy gates only the model-facing fields).",
+      "gaps": [
+        "External providers are partial (next area).",
+        "Presets are config objects, not preset-registry compositions.",
+        "Interrupt waits for the child to settle instead of returning on acceptance.",
+        "Children have a confined foreground bash only, with no owned background jobs.",
+        "Team state is one board per root session."
+      ]
     },
     {
       "area": "Subagent external providers",
-      "status": "not-ported",
+      "status": "partial",
       "dshPackages": [
         "packages/subagent/subagent-claude-code",
         "packages/subagent/subagent-codex",
         "packages/subagent/subagent-acp"
       ],
       "piTools": [],
-      "notes": "Also list_subagent_models. Children run through the Pi SDK only."
+      "notes": "Opt-in through externalSubagents in pi-dsh.json: each entry (claude-code, codex, or acp with a command) adds a subagent_<name> tool. Like DSH, a run is one unattended session of the product in the workspace: the task in, the final answer or a fixed-shape failure diagnostic out, ambient credentials scrubbed from its environment, no follow-up input, reasoning and stderr kept out of the parent session. It goes through the installed CLI (claude -p with stream-json, codex exec --json) or an ACP server over stdio, not DSH's pinned SDK and app-server runtimes. Choosing a provider never widens access: Codex takes the standing sandboxMode as its own --sandbox, Claude Code is limited to an allowlist of file tools, with no MCP servers or skills, under a restrictive mode (acceptEdits by default under workspace-write), a permission setting wider than the sandbox is refused, and an ACP agent runs under bubblewrap with writablePaths for its own state. Also list_subagent_models does not cover these products.",
+      "gaps": [
+        "Claude Code and ACP were run against the real products on a few tasks only (GLM via a Z.ai plan; opencode as the ACP agent); Codex only against its real binary with a local stand-in model server.",
+        "Codex runs through codex exec, not the app-server protocol, and its approval modes map onto one permission setting.",
+        "ACP declares no fs or terminal client capabilities and has no authenticate step; the agent must be logged in beforehand.",
+        "No Plugins-page bundle, and an external run never resumes after a restart."
+      ]
     },
     {
       "area": "PTC",
@@ -192,7 +234,12 @@
       "piTools": [
         "run_code"
       ],
-      "notes": "Plus a mossbed backend with no DSH equivalent."
+      "notes": "Plus a mossbed backend with no DSH equivalent. Resource limits mirror ptc-runtime-node: ptcMaxOutputBytes (64 MiB), ptcMaxPendingCalls (128), ptcMaxMessageBytes (128 MiB). The Python backend runs under the same bubblewrap profile as Node, and both keep a stderr tail for crash diagnostics. A program stopped by a timeout, an abort or a limit gets SIGTERM and then SIGKILL after ptcGraceMs (3000), and the logs it had already written come back with the failure.",
+      "gaps": [
+        "The mossbed backend is killed at once on timeout or abort, with no SIGTERM grace or streamed output.",
+        "The Python backend keeps no state between calls.",
+        "No Landlock fallback runner; bubblewrap only."
+      ]
     },
     {
       "area": "Workflow",
@@ -203,7 +250,12 @@
       ],
       "piTools": [
         "workflow"
-      ]
+      ],
+      "gaps": [
+        "No per-agent provider override, and agent() takes no isolation option.",
+        "No persisted run record."
+      ],
+      "notes": "parallel() and pipeline() follow the dsh guest: pipeline chains stages per item with no cross-stage barrier, a bad argument or tripped cap (workflowMaxAgents, workflowMaxItemsPerCall) ends the script while a failed child nulls only its item, and the script runs under the standing sandbox mode. A script that dies leaves no child running. The first synchronous stretch of a script, up to its first await, runs under workflowSyncTimeoutMs (5000), as in DSH; a loop after an await is ended only by an abort."
     },
     {
       "area": "UI",
@@ -223,7 +275,10 @@
         "terminals",
         "goal"
       ],
-      "notes": "DSH ships web/desktop React panels. A Pi extension can draw footer status + string-array widgets, so pi-dsh renders goal/todos/jobs/agents-terminals-team widgets and a /dsh dashboard instead (src/ui.ts). No clickable panels, no graphs."
+      "notes": "DSH ships web/desktop React panels. A Pi extension can draw footer status + string-array widgets, so pi-dsh renders goal/todos/jobs/agents-terminals-team widgets and a /dsh dashboard instead (src/ui.ts). No clickable panels, no graphs.",
+      "gaps": [
+        "No clickable panels and no graphs."
+      ]
     },
     {
       "area": "SSH sandbox",
@@ -232,7 +287,8 @@
         "packages/ssh/sandbox-ssh"
       ],
       "piTools": [],
-      "notes": "dsh-sandbox-ssh confines processes launched by DSH's SSH subprocess/filesystem providers through a remote helper. pi-dsh has no SSH transport to confine; porting the sandbox without an SSH execution feature would be dead code. Local bubblewrap is the applicable boundary."
+      "notes": "dsh-sandbox-ssh confines processes launched by DSH's SSH subprocess/filesystem providers through a remote helper. pi-dsh has no SSH transport to confine; porting the sandbox without an SSH execution feature would be dead code. Local bubblewrap is the applicable boundary.",
+      "gaps": []
     },
     {
       "area": "Windows sandbox",
@@ -241,7 +297,8 @@
         "packages/sandbox/sandbox-windows-acl"
       ],
       "piTools": [],
-      "notes": "Out of scope by maintainer decision: pi-dsh is Linux-tested."
+      "notes": "Out of scope by maintainer decision: pi-dsh is Linux-tested.",
+      "gaps": []
     }
   ]
 }

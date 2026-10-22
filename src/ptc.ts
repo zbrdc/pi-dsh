@@ -14,56 +14,181 @@ export interface PtcRequest {
   timeoutMs?: number | null; signal?: AbortSignal; prelude?: string;
   stateOwner?: string; sandboxMode?: SandboxMode; sandboxRunner?: string[];
 }
+export type PtcErrorKind = "exception" | "timeout" | "abort" | "worker-exit" | "invalid-output" | "protocol" | "sandbox-unavailable" | "output-limit";
 export interface PtcResult {
   value?: unknown; logs: string[];
-  error?: { kind: "exception" | "timeout" | "abort" | "worker-exit" | "invalid-output" | "protocol" | "sandbox-unavailable"; message: string };
+  error?: { kind: PtcErrorKind; message: string };
+}
+
+/** Resource bounds on one program (dsh ptc-runtime-node config). */
+export interface PtcLimits {
+  /** Combined bytes of serialized logs and the return value. */
+  maxOutputBytes: number;
+  /** Binding calls a program may have in flight at once. */
+  maxPendingCalls: number;
+  /** Bytes of binding-call arguments in flight at once. */
+  maxMessageBytes: number;
+  /** How long a program that was told to stop may keep running before it is killed. */
+  graceMs: number;
+}
+export const DEFAULT_PTC_LIMITS: PtcLimits = { maxOutputBytes: 67_108_864, maxPendingCalls: 128, maxMessageBytes: 134_217_728, graceMs: 3000 };
+
+/** Positive integers from config, else the dsh defaults. */
+export function ptcLimitsFrom(config: Partial<PtcLimits>): PtcLimits {
+  const pick = (value: unknown, fallback: number) => (Number.isSafeInteger(value) && (value as number) > 0 ? (value as number) : fallback);
+  return {
+    maxOutputBytes: pick(config.maxOutputBytes, DEFAULT_PTC_LIMITS.maxOutputBytes),
+    maxPendingCalls: pick(config.maxPendingCalls, DEFAULT_PTC_LIMITS.maxPendingCalls),
+    maxMessageBytes: pick(config.maxMessageBytes, DEFAULT_PTC_LIMITS.maxMessageBytes),
+    graceMs: pick(config.graceMs, DEFAULT_PTC_LIMITS.graceMs),
+  };
+}
+
+/** Ask a process to stop with SIGTERM and kill it if it is still running after `graceMs` (dsh terminateProcess). */
+function stopProcess(proc: ChildProcess, graceMs: number): void {
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  proc.kill("SIGTERM");
+  const timer = setTimeout(() => proc.kill("SIGKILL"), graceMs);
+  timer.unref?.();
+  proc.once("exit", () => clearTimeout(timer));
+}
+
+/** Append `text` to `into` unless the running byte total would pass `cap`. */
+function keepWithinCap(into: { logs: string[]; bytes: number }, text: string, cap: number): void {
+  const cost = Buffer.byteLength(JSON.stringify(text)) + 1;
+  if (into.bytes + cost > cap) return;
+  into.bytes += cost;
+  into.logs.push(text);
 }
 
 const CHILD = join(dirname(fileURLToPath(import.meta.url)), "ptc-child.mjs");
+const STDERR_TAIL_CHARS = 2048;
 let runSeq = 0;
+
+const isSandboxed = (req: PtcRequest): req is PtcRequest & { sandboxMode: SandboxMode } =>
+  req.sandboxMode !== undefined && req.sandboxMode !== "danger-full-access";
+
+/** A confined run fails closed: no bubblewrap, or a runner that cannot confine, means the program does not start. */
+function sandboxFailure(req: PtcRequest): PtcResult | undefined {
+  if (!isSandboxed(req)) return undefined;
+  if (!req.sandboxRunner?.length && !existsSync("/usr/bin/bwrap")) {
+    return { logs: [], error: { kind: "sandbox-unavailable", message: "bubblewrap not found at /usr/bin/bwrap" } };
+  }
+  if (!probeSandboxRunner(req.sandboxRunner, req.cwd ?? process.cwd())) {
+    return { logs: [], error: { kind: "sandbox-unavailable", message: "sandbox runner failed its functional probe (fails closed)" } };
+  }
+  return undefined;
+}
+
+interface RunSpec {
+  program: string; namespaces: Record<string, string[]>; prelude: string; persistent: boolean;
+  timeoutMs: number | null; signal?: AbortSignal;
+}
+interface SessionOptions { cwd: string; sandboxMode?: SandboxMode; sandboxRunner?: string[]; limits: PtcLimits }
 
 class NodeSession {
   proc: ChildProcess;
-  private callWaiters = new Map<string, { resolve: (m: any) => void }>();
   private doneWaiters = new Map<number, (m: any) => void>();
   exited = false;
+  /** Set when the host ended the child itself for a limit, so the result names the limit instead of a bare worker-exit. */
+  private failure: { kind: PtcErrorKind; message: string } | undefined;
+  private stderrTail = "";
+  private exitSummary = "";
+  private pendingCalls = 0;
+  private pendingBytes = 0;
+  /** Logs the running program has produced so far, kept host-side so a stopped program still reports its output. */
+  private streamed = { logs: [] as string[], bytes: 2 };
+  private activeRun = 0;
+  private limits: PtcLimits;
   bindingsFn: () => PtcBindings;
-  constructor(bindings: () => PtcBindings, cwd: string, sandboxMode?: SandboxMode, sandboxRunner?: string[]) { this.bindingsFn = bindings;
-    const sandboxed = sandboxMode !== undefined && sandboxMode !== "danger-full-access";
-    const runner = sandboxRunner && sandboxRunner.length > 0 ? sandboxRunner : ["/usr/bin/bwrap"];
+  constructor(bindings: () => PtcBindings, opts: SessionOptions) {
+    this.bindingsFn = bindings;
+    this.limits = opts.limits;
+    const sandboxed = opts.sandboxMode !== undefined && opts.sandboxMode !== "danger-full-access";
+    const runner = opts.sandboxRunner && opts.sandboxRunner.length > 0 ? opts.sandboxRunner : ["/usr/bin/bwrap"];
     this.proc = sandboxed
-      ? fork(CHILD, [], { cwd, env: { HOME: "/tmp" }, silent: true, execPath: runner[0] as string, execArgv: [...runner.slice(1), ...bwrapArgs(sandboxMode, cwd), process.execPath, "--max-old-space-size=512"] })
-      : fork(CHILD, [], { cwd, env: {}, silent: true, execArgv: ["--max-old-space-size=512"] });
-    this.proc.on("exit", () => { this.exited = true; });
-    this.proc.on("message", async (msg: any) => {
-      if (msg?.type === "call") {
-        const [ns, fn] = String(msg.fn).split(".");
-        try {
-          const f = this.bindingsFn()[ns ?? ""]?.[fn ?? ""];
-          if (!f) throw new Error(`unknown binding: ${msg.fn}`);
-          const v = await f(msg.args?.[0]);
-          this.proc.send({ type: "call-result", callId: msg.callId, ok: true, value: v === undefined ? null : v });
-        } catch (e) {
-          this.proc.send({ type: "call-result", callId: msg.callId, ok: false, error: e instanceof Error ? e.message : String(e) });
-        }
-      } else if (msg?.type === "done") {
+      ? fork(CHILD, [], { cwd: opts.cwd, env: { HOME: "/tmp" }, silent: true, execPath: runner[0] as string, execArgv: [...runner.slice(1), ...bwrapArgs(opts.sandboxMode as SandboxMode, opts.cwd), process.execPath, "--max-old-space-size=512"] })
+      : fork(CHILD, [], { cwd: opts.cwd, env: {}, silent: true, execArgv: ["--max-old-space-size=512"] });
+    // Drain stdout so an unread pipe cannot block a child that writes to it synchronously, and keep the stderr tail so a crash has a diagnostic.
+    this.proc.stdout?.resume();
+    this.proc.stderr?.on("data", (d: Buffer) => { this.stderrTail = (this.stderrTail + d.toString("utf8")).slice(-STDERR_TAIL_CHARS); });
+    this.proc.on("exit", (code, signal) => {
+      this.exited = true;
+      this.exitSummary = code !== null ? `code ${code}` : `signal ${signal}`;
+    });
+    this.proc.on("message", (msg: any) => {
+      if (msg?.type === "call") void this.handleCall(msg);
+      else if (msg?.type === "log") { if (msg.runId === this.activeRun) keepWithinCap(this.streamed, String(msg.text), this.limits.maxOutputBytes); }
+      else if (msg?.type === "done") {
         this.doneWaiters.get(msg.runId)?.(msg);
         this.doneWaiters.delete(msg.runId);
       }
     });
   }
-  run(program: string, namespaces: Record<string, string[]>, prelude: string, persistent: boolean, timeoutMs: number | null, signal?: AbortSignal): Promise<any> {
+  private reply(message: object): void {
+    if (this.exited || !this.proc.connected) return; // the program is gone; its in-flight calls finish unheard
+    this.proc.send(message, () => undefined);
+  }
+  /** Stop the child for a timeout, abort or limit breach; the pending run reports `kind` with `message` and the output so far. */
+  private terminate(kind: PtcErrorKind, message: string): void {
+    if (this.failure) return;
+    this.failure = { kind, message };
+    stopProcess(this.proc, this.limits.graceMs);
+  }
+  private async handleCall(msg: any): Promise<void> {
+    const bytes = Buffer.byteLength(JSON.stringify(msg.args ?? null));
+    this.pendingCalls++;
+    this.pendingBytes += bytes;
+    try {
+      if (this.pendingCalls > this.limits.maxPendingCalls || this.pendingBytes > this.limits.maxMessageBytes) {
+        this.terminate("protocol", "pending binding calls exceed configured limits");
+        return;
+      }
+      const [ns, fn] = String(msg.fn).split(".");
+      const f = this.bindingsFn()[ns ?? ""]?.[fn ?? ""];
+      if (!f) throw new Error(`unknown binding: ${msg.fn}`);
+      const v = await f(msg.args?.[0]);
+      this.reply({ type: "call-result", callId: msg.callId, ok: true, value: v === undefined ? null : v });
+    } catch (e) {
+      this.reply({ type: "call-result", callId: msg.callId, ok: false, error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.pendingCalls--;
+      this.pendingBytes -= bytes;
+    }
+  }
+  private exitMessage(): string {
+    const tail = this.stderrTail.trim();
+    return `worker process exited (${this.exitSummary})${tail ? `: ${tail}` : ""}`;
+  }
+  /** Failure text plus the stderr tail, so a stopped program leaves a diagnostic. */
+  private withStderr(message: string): string {
+    const tail = this.stderrTail.trim();
+    return tail ? `${message}: ${tail}` : message;
+  }
+  run(spec: RunSpec): Promise<any> {
     const runId = ++runSeq;
+    this.activeRun = runId;
+    this.streamed = { logs: [], bytes: 2 };
     return new Promise((resolve) => {
-      const timer = timeoutMs === null ? undefined : setTimeout(() => {
-        this.proc.kill("SIGKILL"); resolve({ __kind: "timeout" });
-      }, timeoutMs);
-      const onAbort = () => { this.proc.kill("SIGKILL"); resolve({ __kind: "abort" }); };
-      if (signal?.aborted) { resolve({ __kind: "abort" }); return; }
-      signal?.addEventListener("abort", onAbort, { once: true });
-      this.doneWaiters.set(runId, (m) => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); resolve(m); });
-      this.proc.once("exit", () => { clearTimeout(timer); resolve({ __kind: "worker-exit" }); });
-      this.proc.send({ type: "run", runId, code: program, namespaces, prelude, persistent });
+      if (spec.signal?.aborted) { resolve({ __kind: "abort", message: "aborted", logs: [] }); return; }
+      const timer = spec.timeoutMs === null ? undefined : setTimeout(() => this.terminate("timeout", "program timed out"), spec.timeoutMs);
+      const onAbort = () => this.terminate("abort", "aborted");
+      spec.signal?.addEventListener("abort", onAbort, { once: true });
+      const settle = () => { clearTimeout(timer); spec.signal?.removeEventListener("abort", onAbort); };
+      this.doneWaiters.set(runId, (m) => { settle(); resolve(m); });
+      this.proc.once("exit", () => {
+        settle();
+        const stopped = this.failure;
+        resolve({
+          __kind: stopped?.kind ?? "worker-exit",
+          message: stopped ? this.withStderr(stopped.message) : this.exitMessage(),
+          logs: this.streamed.logs,
+        });
+      });
+      this.proc.send({
+        type: "run", runId, code: spec.program, namespaces: spec.namespaces, prelude: spec.prelude, persistent: spec.persistent,
+        maxOutputBytes: this.limits.maxOutputBytes,
+      });
     });
   }
   dispose(): void { if (!this.exited) this.proc.kill("SIGKILL"); }
@@ -74,32 +199,35 @@ export class NodePtcProvider {
   readonly timeout = { defaultMs: 120_000, maxMs: 600_000 };
   private persistent = new Map<string, NodeSession>();
   private chains = new Map<string, Promise<unknown>>();
+  private limits: PtcLimits;
+  constructor(limits: PtcLimits = DEFAULT_PTC_LIMITS) { this.limits = limits; }
 
   async run(req: PtcRequest): Promise<PtcResult> {
-    if (req.sandboxMode && req.sandboxMode !== "danger-full-access" && !req.sandboxRunner?.length && !existsSync("/usr/bin/bwrap")) {
-      return { logs: [], error: { kind: "sandbox-unavailable", message: "bubblewrap not found at /usr/bin/bwrap" } };
-    }
-    if (req.sandboxMode && req.sandboxMode !== "danger-full-access" && !probeSandboxRunner(req.sandboxRunner, req.cwd ?? process.cwd())) {
-      return { logs: [], error: { kind: "sandbox-unavailable", message: "sandbox runner failed its functional probe (fails closed)" } };
-    }
+    const unavailable = sandboxFailure(req);
+    if (unavailable) return unavailable;
     const timeoutMs = req.timeoutMs === null ? null : Math.min(Math.max(1, req.timeoutMs ?? this.timeout.defaultMs), this.timeout.maxMs);
     const namespaces: Record<string, string[]> = {};
     for (const [ns, fns] of Object.entries(req.bindings ?? {})) namespaces[ns] = Object.keys(fns);
+    const open = () => new NodeSession(() => req.bindings ?? {}, { cwd: req.cwd ?? process.cwd(), sandboxMode: req.sandboxMode, sandboxRunner: req.sandboxRunner, limits: this.limits });
     const exec = async (): Promise<PtcResult> => {
       let session: NodeSession;
       let persistent = false;
       if (req.stateOwner) {
         persistent = true;
-        session = this.persistent.get(req.stateOwner) ?? new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode, req.sandboxRunner);
-        if (session.exited) session = new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode, req.sandboxRunner);
+        session = this.persistent.get(req.stateOwner) ?? open();
+        if (session.exited) session = open();
         this.persistent.set(req.stateOwner, session);
       } else {
-        session = new NodeSession(() => req.bindings ?? {}, req.cwd ?? process.cwd(), req.sandboxMode, req.sandboxRunner);
+        session = open();
       }
       try {
-        const msg = await session.run(req.program, namespaces, req.prelude ?? "", persistent, timeoutMs, req.signal);
-        if (msg?.__kind) return { logs: [], error: { kind: msg.__kind, message: msg.__kind === "timeout" ? "program timed out" : String(msg.__kind) } };
-        if (!msg?.ok) return { logs: msg?.logs ?? [], error: { kind: "exception", message: msg?.error ?? "program failed" } };
+        const msg = await session.run({ program: req.program, namespaces, prelude: req.prelude ?? "", persistent, timeoutMs, signal: req.signal });
+        if (msg?.__kind) return { logs: msg.logs ?? [], error: { kind: msg.__kind, message: msg.message ?? String(msg.__kind) } };
+        if (!msg?.ok) {
+          // Retained variables cannot be trusted after an output overflow, so the persistent process is dropped (dsh).
+          if (msg?.errorKind === "output-limit" && req.stateOwner) this.release(req.stateOwner);
+          return { logs: msg?.logs ?? [], error: { kind: msg?.errorKind ?? "exception", message: msg?.error ?? "program failed" } };
+        }
         try { assertLosslessJson(msg.value); } catch (e) { return { logs: msg.logs ?? [], error: { kind: "invalid-output", message: e instanceof Error ? e.message : String(e) } }; }
         return { value: msg.value, logs: msg.logs ?? [] };
       } finally {
@@ -189,25 +317,54 @@ export class MossbedProvider {
 }
 
 /** Python provider: one CPython subprocess per run, synchronous tool bridge.
- * Program assigns `result`; tools are called as tools.<name>(args_dict). */
+ * Program assigns `result`; tools are called as tools.<name>(args_dict).
+ * Under a sandbox mode the interpreter runs inside the same bubblewrap profile as Node, so choosing this backend never widens access. */
 export class PythonPtcProvider {
   readonly language = "python";
+  private limits: PtcLimits;
+  constructor(limits: PtcLimits = DEFAULT_PTC_LIMITS) { this.limits = limits; }
+
+  private launch(req: PtcRequest, script: string): ChildProcess {
+    const cwd = req.cwd ?? process.cwd();
+    if (!isSandboxed(req)) return spawn("python3", ["-u", script], { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    const runner = req.sandboxRunner?.length ? req.sandboxRunner : ["/usr/bin/bwrap"];
+    return spawn(runner[0] as string, [...runner.slice(1), ...bwrapArgs(req.sandboxMode, cwd), "python3", "-u", script], {
+      cwd, stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env["PATH"] ?? "/usr/bin:/bin", HOME: "/tmp" },
+    });
+  }
+
   async run(req: PtcRequest): Promise<PtcResult> {
+    const unavailable = sandboxFailure(req);
+    if (unavailable) return unavailable;
     const script = join(dirname(fileURLToPath(import.meta.url)), "ptc-child.py");
     return new Promise((resolve) => {
-      const proc = spawn("python3", ["-u", script], { cwd: req.cwd ?? process.cwd(), stdio: ["pipe", "pipe", "pipe"] });
-      let buf = ""; let done = false;
+      const proc = this.launch(req, script);
+      let buf = ""; let done = false; let stderrTail = "";
+      const streamed = { logs: [] as string[], bytes: 2 };
+      /** Why the host asked the program to stop; the process is gone by the time this is reported. */
+      let stopping: { kind: PtcErrorKind; message: string } | undefined;
+      const withStderr = (message: string) => (stderrTail.trim() ? `${message}: ${stderrTail.trim()}` : message);
       const finish = (r: PtcResult) => { if (!done) { done = true; clearTimeout(timer); try { proc.kill("SIGKILL"); } catch { /* gone */ } resolve(r); } };
-      const timer = setTimeout(() => finish({ logs: [], error: { kind: "timeout", message: "python program timed out" } }), req.timeoutMs === null ? 600_000 : Math.min(req.timeoutMs ?? 120_000, 600_000));
-      req.signal?.addEventListener("abort", () => finish({ logs: [], error: { kind: "abort", message: "aborted" } }), { once: true });
+      /** Timeout, abort and limit breaches stop the program with SIGTERM, then report once it has exited with what it logged. */
+      const stop = (kind: PtcErrorKind, message: string) => {
+        if (done || stopping) return;
+        stopping = { kind, message };
+        stopProcess(proc, this.limits.graceMs);
+      };
+      const timer = setTimeout(() => stop("timeout", "python program timed out"), req.timeoutMs === null ? 600_000 : Math.min(req.timeoutMs ?? 120_000, 600_000));
+      if (req.signal?.aborted) stop("abort", "aborted");
+      else req.signal?.addEventListener("abort", () => stop("abort", "aborted"), { once: true });
+      proc.stderr?.on("data", (d: Buffer) => { stderrTail = (stderrTail + d.toString("utf8")).slice(-STDERR_TAIL_CHARS); });
       proc.stdout?.on("data", async (d: Buffer) => {
         buf += d.toString("utf8");
+        if (buf.length > this.limits.maxMessageBytes) { stop("protocol", "python program wrote an oversized message"); return; }
         let idx;
         while ((idx = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
           if (!line.trim()) continue;
           let msg: any; try { msg = JSON.parse(line); } catch { continue; }
-          if (msg.type === "call") {
+          if (msg.type === "log") keepWithinCap(streamed, String(msg.text), this.limits.maxOutputBytes);
+          else if (msg.type === "call") {
             const [ns, fn] = String(msg.fn).split(".");
             try {
               const f = (req.bindings ?? {})[ns ?? ""]?.[fn ?? ""];
@@ -218,7 +375,7 @@ export class PythonPtcProvider {
               proc.stdin?.write(JSON.stringify({ type: "call-result", callId: msg.callId, ok: false, error: e instanceof Error ? e.message : String(e) }) + "\n");
             }
           } else if (msg.type === "done") {
-            if (!msg.ok) finish({ logs: msg.logs ?? [], error: { kind: "exception", message: msg.error ?? "python program failed" } });
+            if (!msg.ok) finish({ logs: msg.logs ?? [], error: { kind: msg.errorKind ?? "exception", message: msg.error ?? "python program failed" } });
             else {
               try { assertLosslessJson(msg.value); finish({ value: msg.value, logs: msg.logs ?? [] }); }
               catch (e) { finish({ logs: msg.logs ?? [], error: { kind: "invalid-output", message: e instanceof Error ? e.message : String(e) } }); }
@@ -227,9 +384,15 @@ export class PythonPtcProvider {
         }
       });
       proc.once("error", (e) => finish({ logs: [], error: { kind: "worker-exit", message: e.message } }));
+      // "close", not "exit": stdout is fully read by then, so a finished program's result is not mistaken for a crash.
+      proc.once("close", (code, signal) => {
+        if (stopping) { finish({ logs: streamed.logs, error: { kind: stopping.kind, message: withStderr(stopping.message) } }); return; }
+        const tail = stderrTail.trim();
+        finish({ logs: streamed.logs, error: { kind: "worker-exit", message: `python process exited (${code !== null ? `code ${code}` : `signal ${signal}`})${tail ? `: ${tail}` : ""}` } });
+      });
       const namespaces: Record<string, string[]> = {};
       for (const [ns, fns] of Object.entries(req.bindings ?? {})) namespaces[ns] = Object.keys(fns);
-      proc.stdin?.write(JSON.stringify({ code: req.program, namespaces }) + "\n");
+      proc.stdin?.write(JSON.stringify({ code: req.program, namespaces, maxOutputBytes: this.limits.maxOutputBytes }) + "\n");
     });
   }
 }

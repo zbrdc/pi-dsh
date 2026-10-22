@@ -174,9 +174,82 @@ test("/plan <task> in print mode: no UI calls, task delivered at before_agent_st
   // Delivered once: a second turn does not repeat the queued task.
   const again = await h.emit("before_agent_start", { ...startEvent, systemPromptOptions: { sections: {} } });
   assert.doesNotMatch(again.message.content, /Plan task/);
-  // Headless exit_plan_mode auto-approves (no dialog surface exists).
+  // Headless exit_plan_mode cannot be approved (no dialog surface exists), so plan mode stays on.
   const exit = await h.tools.get("exit_plan_mode").execute("9", { plan: "# Plan" }, undefined, undefined, h.ctx);
-  assert.match(exit.content[0].text, /Plan approved/);
+  assert.equal(exit.isError, true);
+  assert.match(exit.content[0].text, /no interactive UI/);
+  assert.equal((h.entries.filter(([name]: any) => name === "pi-dsh/plan").at(-1)?.[1] as { active?: boolean } | undefined)?.active, true);
+});
+
+/** Drive one goal round to the point where the model is about to start its turn. */
+async function requestRound(h: ReturnType<typeof makeHarness>, objective = "ship the fix") {
+  await h.emit("session_start", { type: "session_start", reason: "startup" });
+  await h.commands.get("goal").handler(objective, h.ctx);
+  const boundary = await h.emit("agent_before_settle", { type: "agent_before_settle", outcome: "completed", continue: false, entries: [] });
+  const draft = boundary.entries.at(-1);
+  assert.equal(draft.customType, "pi-dsh/goal-round");
+  return { draft, message: { role: "custom", customType: draft.customType, content: draft.content, display: true, details: draft.details, timestamp: 0 } };
+}
+const lastGoal = (h: ReturnType<typeof makeHarness>) => h.entries.filter(([name]) => name === "pi-dsh/goal").at(-1)?.[1] as any;
+const withdrawals = (h: ReturnType<typeof makeHarness>) => h.entries.filter(([name]) => name === "pi-dsh/goal-withdrawn").map(([, data]) => data as any);
+
+test("a goal round carries the identity it was requested under and counts when its turn starts", async () => {
+  const h = makeHarness("tui", true);
+  const { draft, message } = await requestRound(h);
+  assert.deepEqual({ ...draft.details, goalId: typeof draft.details.goalId }, { goalId: "string", revision: 1, round: 1 });
+  assert.equal(lastGoal(h).roundsStarted, 0, "the round counted before its turn started");
+  await h.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
+  assert.equal(lastGoal(h).roundsStarted, 1);
+  assert.deepEqual(withdrawals(h), []);
+  const context = await h.emit("context", { type: "context", messages: [message] });
+  assert.equal(context?.messages?.[0]?.content ?? message.content, message.content, "a live round prompt was rewritten");
+});
+
+for (const [name, change, reason] of [
+  ["cleared", async (h: ReturnType<typeof makeHarness>) => { await h.commands.get("goal").handler("clear", h.ctx); }, /cleared/],
+  ["replaced", async (h: ReturnType<typeof makeHarness>) => { await h.commands.get("goal").handler("a different objective", h.ctx); }, /replaced/],
+  ["paused", async (h: ReturnType<typeof makeHarness>) => { await h.commands.get("goal").handler("pause", h.ctx); }, /changed/],
+  ["paused and resumed", async (h: ReturnType<typeof makeHarness>) => { await h.commands.get("goal").handler("pause", h.ctx); await h.commands.get("goal").handler("resume", h.ctx); }, /changed/],
+] as const) {
+  test(`a goal round requested before the goal was ${name} is withdrawn instead of started`, async () => {
+    const h = makeHarness("tui", true);
+    const { message } = await requestRound(h);
+    await change(h);
+    await h.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
+    assert.equal(withdrawals(h).length, 1);
+    assert.match(withdrawals(h)[0].reason, reason);
+    assert.notEqual(lastGoal(h)?.roundsStarted, 1, "a withdrawn round was counted");
+    const context = await h.emit("context", { type: "context", messages: [message] });
+    assert.match(context.messages[0].content[0].text, /^<goal_round_withdrawn>/);
+    assert.doesNotMatch(JSON.stringify(context.messages[0]), /Continue working toward the objective/);
+    // The stale round must not be mistaken for a round that never started.
+    await h.emit("agent_settled", { type: "agent_settled", aborted: false });
+    assert.notEqual(lastGoal(h)?.status, "blocked");
+  });
+}
+
+test("a goal round is withdrawn when a message from the user is already waiting", async () => {
+  const h = makeHarness("tui", true);
+  const { message } = await requestRound(h);
+  h.ctx.hasPendingMessages = () => true;
+  await h.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
+  assert.match(withdrawals(h)[0].reason, /waiting/);
+  const context = await h.emit("context", { type: "context", messages: [message] });
+  assert.match(context.messages[0].content[0].text, /^<goal_round_withdrawn>/);
+});
+
+test("a withdrawn round stays withdrawn after a restart", async () => {
+  const first = makeHarness("tui", true);
+  const { message } = await requestRound(first);
+  await first.commands.get("goal").handler("clear", first.ctx);
+  await first.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
+  const stored = first.entries.map(([customType, data]) => ({ type: "custom", customType, data }));
+
+  const restarted = makeHarness("tui", true);
+  restarted.ctx.sessionManager.getBranch = () => stored;
+  await restarted.emit("session_start", { type: "session_start", reason: "resume" });
+  const context = await restarted.emit("context", { type: "context", messages: [message] });
+  assert.match(context.messages[0].content[0].text, /^<goal_round_withdrawn>/);
 });
 
 test("tool_call caps timeout-shaped inputs on foreign tools", async () => {
@@ -195,6 +268,15 @@ test("dsh-compat manifest matches registered tools and commands", async () => {
     if (area.status === "not-ported" || area.status === "not-applicable") continue;
     for (const tool of area.piTools ?? []) assert.ok(h.tools.has(tool), `${area.area}: tool ${tool} registered`);
     for (const cmd of area.piCommands ?? []) assert.ok(h.commands.has(cmd), `${area.area}: command /${cmd} registered`);
+  }
+});
+
+test("dsh-compat ledger lists known gaps for every area, and an unported area names at least one", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../dsh-compat.json", import.meta.url), "utf8"));
+  for (const area of manifest.areas) {
+    assert.ok(Array.isArray(area.gaps), `${area.area}: gaps must be an array (empty when there are none)`);
+    for (const gap of area.gaps) assert.ok(typeof gap === "string" && gap.trim() !== "", `${area.area}: gap entries are non-empty strings`);
+    if (area.status === "not-ported" || area.status === "partial") assert.ok(area.gaps.length > 0, `${area.area} is ${area.status} but lists no gap`);
   }
 });
 

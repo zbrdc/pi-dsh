@@ -29,12 +29,39 @@ globals_dict = {"__name__": "__ptc__"}
 for ns in (req.get("namespaces") or {}):
     globals_dict[ns] = NS(ns)
 
-buf = io.StringIO()
+class OutputLimit(BaseException):
+    """Not an Exception, so a program's own `except Exception` cannot swallow the cap."""
+
+class CappedOutput(io.StringIO):
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = limit
+        self.used = 2  # the empty logs array: []
+        self.overflowed = False
+        self.pending = ""
+
+    def write(self, text):
+        cost = len(text.encode("utf-8"))
+        if self.limit and self.used + cost > self.limit:
+            self.overflowed = True
+            raise OutputLimit()
+        self.used += cost
+        self.pending += text
+        # Complete lines go to the host as they appear, so a program that is stopped still reports its output.
+        *lines, self.pending = self.pending.split("\n")
+        for line in lines:
+            real_out.write(json.dumps({"type": "log", "text": line}) + "\n")
+            real_out.flush()
+        return super().write(text)
+
+buf = CappedOutput(int(req.get("maxOutputBytes") or 0))
 old = sys.stdout
 sys.stdout = buf
 error = None
 try:
     exec(req["code"], globals_dict)
+except OutputLimit:
+    pass
 except Exception:
     error = traceback.format_exc().strip().splitlines()[-1]
 finally:
@@ -42,11 +69,20 @@ finally:
 
 value = globals_dict.get("result")
 try:
-    json.dumps(value)
+    value_bytes = len(json.dumps(value).encode("utf-8"))
 except Exception:
     value = repr(value)
-real_out.write(json.dumps({
-    "type": "done", "ok": error is None, "error": error,
-    "value": value, "logs": buf.getvalue().splitlines(),
-}) + "\n")
+    value_bytes = len(json.dumps(value).encode("utf-8"))
+if not buf.overflowed and buf.limit and buf.used + value_bytes > buf.limit:
+    buf.overflowed = True
+if buf.overflowed:
+    real_out.write(json.dumps({
+        "type": "done", "ok": False, "errorKind": "output-limit",
+        "error": f"outer output exceeded {buf.limit} bytes", "logs": buf.getvalue().splitlines(),
+    }) + "\n")
+else:
+    real_out.write(json.dumps({
+        "type": "done", "ok": error is None, "error": error,
+        "value": value, "logs": buf.getvalue().splitlines(),
+    }) + "\n")
 real_out.flush()

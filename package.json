@@ -40,7 +40,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test --test-timeout=60000 tests/core.test.ts tests/extension.test.ts tests/outbox.test.ts tests/worktree.test.ts tests/pruner.test.ts tests/goal.integration.test.ts tests/subagent.integration.test.ts tests/outbox.integration.test.ts tests/bash.integration.test.ts tests/pruner.integration.test.ts",
+    "test": "node --experimental-strip-types --test --test-timeout=60000 tests/core.test.ts tests/extension.test.ts tests/outbox.test.ts tests/worktree.test.ts tests/pruner.test.ts tests/goal.integration.test.ts tests/subagent.integration.test.ts tests/outbox.integration.test.ts tests/bash.integration.test.ts tests/pruner.integration.test.ts tests/workflow.test.ts tests/workflow.integration.test.ts tests/ptc.test.ts tests/jobs.test.ts tests/plan.integration.test.ts tests/model-selection.integration.test.ts tests/external.test.ts tests/external.integration.test.ts tests/paths.test.ts tests/sandbox.test.ts",
     "typecheck": "tsc -p tsconfig.json",
     "check": "npm run typecheck && npm test",
     "check:drift": "node scripts/check-dsh-drift.mjs",

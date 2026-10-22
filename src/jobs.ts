@@ -9,6 +9,8 @@ export interface JobSnapshot {
   id: string; kind: string; label: string; status: JobStatus;
   progress?: string; result?: string; startedAt: number; finishedAt?: number;
   outFile?: string; exitFile?: string;
+  /** Why a killed job was cancelled; present only when it settled as killed. */
+  detail?: string;
 }
 export interface JobHandle {
   append(text: string): void;
@@ -18,7 +20,7 @@ export interface JobHandle {
 interface Job {
   snap: JobSnapshot; ring: OutputRing; owner: string;
   cancel: (reason?: string) => void; controller: AbortController;
-  awaited: boolean; killRequested: boolean; resultDelivered: boolean;
+  awaited: boolean; killRequested: boolean; killReason?: string; resultDelivered: boolean;
   done: Promise<void>; settleWaiters: Array<() => void>;
 }
 
@@ -96,6 +98,8 @@ export class JobRegistry {
         job.snap.status = controller.signal.aborted ? "killed" : "failed";
         job.ring.append(`\n[error: ${err instanceof Error ? err.message : String(err)}]\n`);
       } finally {
+        // The reason describes a kill that landed; a job that outran its kill request keeps no detail.
+        if (job.snap.status === "killed") job.snap.detail = job.killReason ?? "cancelled";
         job.snap.finishedAt = Date.now();
         this.writeSnapshot(job);
         for (const wake of job.settleWaiters) wake();
@@ -129,7 +133,7 @@ export class JobRegistry {
       job.resultDelivered = true;
       text += (text ? "\n" : "") + job.snap.result;
     }
-    return { text: `${text}\n[status: ${job.snap.status}]`, job: { ...job.snap } };
+    return { text: `${text}\n[status: ${job.snap.status}${job.snap.detail ? ` (${job.snap.detail})` : ""}]`, job: { ...job.snap } };
   }
   private async waitForSettle(job: Job, timeoutMs: number, signal: AbortSignal | undefined): Promise<void> {
     let wake!: () => void;
@@ -140,12 +144,13 @@ export class JobRegistry {
     try { await woken; }
     finally { clearTimeout(timer); signal?.removeEventListener("abort", wake); }
   }
-  async kill(id: string, owner: string, _reason?: string): Promise<{ outcome: string; job: JobSnapshot }> {
+  async kill(id: string, owner: string, reason?: string): Promise<{ outcome: string; job: JobSnapshot }> {
     const job = this.get(id, owner);
     if (!job) throw new Error(`unknown job: ${id}`);
     if (job.snap.status !== "running") return { outcome: "already-finished", job: { ...job.snap } };
     job.killRequested = true;
-    job.cancel(_reason);
+    job.killReason = reason?.trim() || undefined;
+    job.cancel(reason);
     await job.done;
     return { outcome: "cancellation-requested", job: { ...job.snap } };
   }
@@ -153,7 +158,7 @@ export class JobRegistry {
    * survive a process exit when keepDurable is set, so restart can reconcile them. */
   async disposeOwner(owner: string, opts?: { keepDurable?: boolean }): Promise<void> {
     const running = [...this.jobs.values()].filter((j) => j.owner === owner && j.snap.status === "running" && !(opts?.keepDurable && j.snap.exitFile));
-    for (const job of running) job.cancel();
+    for (const job of running) { job.killReason = "session ended"; job.cancel(); }
     await Promise.allSettled(running.map((j) => j.done));
   }
 }
