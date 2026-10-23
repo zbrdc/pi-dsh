@@ -14,6 +14,8 @@ export interface UiState {
   goal?: Goal; todos: TodoItem[]; planActive: boolean;
   /** Notices waiting for the model (see outbox.ts). */
   inbox?: number;
+  /** Active reminders of this session (see schedule-service.ts). */
+  reminders?: number;
   jobs: JobSnapshot[]; agents: CatalogEntry[]; terminals: TerminalRow[]; teamTasks: TeamTaskRow[];
 }
 
@@ -43,6 +45,7 @@ export function renderStatusLine(state: UiState): string {
   const terms = state.terminals.filter((t) => t.alive).length;
   if (terms > 0) parts.push(`${terms} term${terms === 1 ? "" : "s"}`);
   if (state.inbox) parts.push(`${state.inbox} notice${state.inbox === 1 ? "" : "s"}`);
+  if (state.reminders) parts.push(`${state.reminders} reminder${state.reminders === 1 ? "" : "s"}`);
   return parts.join(" · ");
 }
 

@@ -2,6 +2,10 @@
 
 All notable changes to pi-dsh will be documented in this file.
 
+## Unreleased
+
+- Schedule (dsh schedule, tool-schedule): `schedule_create`, `schedule_list`, `schedule_update`, `schedule_delete` and `/schedule`. Six rules (`after_seconds`, `at`, `every_seconds`, `daily`, `weekly`, `cron`), wall-clock rules in an explicit IANA zone with DSH's gap-skip and earlier-overlap behavior, latest-only catch-up after downtime, in-place updates that keep id and history, saved delivery history with a retention window and cap, and `schedule: false` to turn it off. Due reminders go through the notice outbox, wake an idle session even under `completionDelivery: "quiet"`, and ride the current run otherwise. Reminders are stored one file per session under `~/.pi/agent/pi-dsh/schedule/` and fire only while that session runs. Zone arithmetic is built on `Intl` (no new dependency) and was cross-checked against the Temporal polyfill DSH uses over about 1.2 million zone probes and 370,000 rule comparisons.
+
 ## 0.4.0 - 2026-10-22
 
 - External subagents: `externalSubagents` in `pi-dsh.json` adds `subagent_claude_code`, `subagent_codex`, and ACP tools that run a task as one unattended session of the installed product and return its final answer or a fixed-shape failure line (dsh subagent-claude-code, subagent-codex, subagent-acp). The product's environment is scrubbed of ambient credentials, stderr never reaches the model, and access is capped by the standing `sandboxMode`: Codex takes it as `--sandbox`, Claude Code gets an allowlist of file tools with no MCP servers or skills and `acceptEdits` under `workspace-write`, a wider setting is refused, and an ACP agent runs under bubblewrap with `writablePaths`. Run against the real Claude Code CLI (GLM via a Z.ai plan) and a real `opencode acp`; Codex only against the real binary with a local stand-in model server.

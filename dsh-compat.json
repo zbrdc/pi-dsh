@@ -299,6 +299,33 @@
       "piTools": [],
       "notes": "Out of scope by maintainer decision: pi-dsh is Linux-tested.",
       "gaps": []
+    },
+    {
+      "area": "Schedule",
+      "status": "partial",
+      "dshPackages": [
+        "packages/schedule/schedule",
+        "packages/schedule/tool-schedule"
+      ],
+      "piTools": [
+        "schedule_create",
+        "schedule_list",
+        "schedule_update",
+        "schedule_delete"
+      ],
+      "piCommands": [
+        "schedule"
+      ],
+      "notes": "All six rules (after, at, every, daily, weekly, cron) with DSH's validation codes, canonical cron spelling, Vixie day matching, DST gap skip and earlier-overlap, committed UTC targets, latest-only catch-up, in-place updates, title and prompt rules, anti-forgery framing, saved delivery history with retention, and a stored-record decoder as strict as DSH's. Delivery goes through the notice outbox. Zone arithmetic is Intl-based and was compared with the Temporal polyfill DSH uses (about 1.2M zone probes and 372k rule comparisons, no differences).",
+      "gaps": [
+        "No Host process: a reminder fires only while Pi runs the session that owns it. What came due while closed arrives when that session opens (latest occurrence per rule); other sessions' reminders only list under /schedule all.",
+        "deliveredAt records the moment the reminder entered the session's outbox (which is persisted in the session log), not a Session flush acknowledgment; a crash between delivery and the task write can deliver twice, as in DSH.",
+        "Update has no expected-record compare-and-set and no schedule_conflict result, because one process owns each session's file.",
+        "No Automation tasks page, reminder catalog UI or archive admission; /schedule is a text view and the status line shows the active count.",
+        "No time-context tool: the model is told your system zone in the schedule_create description and takes the date from Pi's prompt.",
+        "Delegated children and external agent products never receive the tools (structural, not a subagent_session refusal).",
+        "Zone offsets are sampled every 6 hours around a date rather than read from tzdata transitions. That is exact while no zone has two offset changes within 6 hours; across 420 zones from 1800 to 2200 (68,385 transitions) the closest pair is 237 hours apart, so only a future tzdata release could break it."
+      ]
     }
   ]
 }

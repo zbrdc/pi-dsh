@@ -105,6 +105,8 @@ export async function createHarness(options: HarnessOptions = {}) {
       }
       throw new Error("session did not settle");
     },
+    /** What Pi's runtime emits when the process quits, so extensions can release timers and processes. */
+    shutdown: () => session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" } as any),
     dispose: () => session.dispose(),
   };
 }

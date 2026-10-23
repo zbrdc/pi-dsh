@@ -18,6 +18,9 @@ import { NodePtcProvider, MossbedProvider, PythonPtcProvider, ptcLimitsFrom, typ
 import { workflowLimitsFrom, workflowProgram, workflowSyncTimeoutFrom } from "./workflow.ts";
 import { FATAL_MARKER } from "./workflow-guest.mjs";
 import { Outbox, runInboxCommand } from "./outbox.ts";
+import { ScheduleService } from "./schedule-service.ts";
+import { registerScheduleTools } from "./schedule-tools.ts";
+import { runScheduleCommand } from "./schedule-command.ts";
 import { agentDir, piDshDir } from "./paths.ts";
 import { DEFAULT_KEEP_RECENT_RESULTS, DEFAULT_MAX_RESULT_CHARS, contextChars, imageExtension, planPrune, type ProjectedEntry } from "./pruner.ts";
 import { SubagentManager, createSdkChild, renderAgentLine, type CatalogEntry } from "./subagent.ts";
@@ -59,6 +62,8 @@ interface Config {
   workflowMaxAgents?: number; workflowMaxItemsPerCall?: number; workflowSyncTimeoutMs?: number;
   /** Other agent products a task can be delegated to (claude-code, codex, acp); each entry adds a subagent_<name> tool. */
   externalSubagents?: Record<string, ExternalConfig>;
+  /** Reminders (dsh schedule): adds schedule_create/list/update/delete and /schedule. Off removes the four tool schemas from every request. */
+  schedule: boolean; scheduleHistoryDays?: number; scheduleHistoryRecords?: number;
 }
 function loadConfig(): Config {
   const defaults: Config = {
@@ -66,7 +71,7 @@ function loadConfig(): Config {
     ptcOnly: false, persistentPtc: false, maxActiveSubagents: 8, goalBlockedThreshold: 3,
     sandboxMode: "danger-full-access", maxParallelSubCalls: 10, completionDelivery: "wakeup", noticeCoalesceMs: 100,
     uiWidgets: true, toolTimeoutAction: "abort", durableTerminals: false,
-    maxSubagentDepth: 1, maxTeamMembers: 16, maxTeamTasks: 256, jobKillGraceMs: 3000,
+    maxSubagentDepth: 1, maxTeamMembers: 16, maxTeamTasks: 256, jobKillGraceMs: 3000, schedule: true,
   };
   try {
     const path = join(agentDir(), "pi-dsh.json");
@@ -122,6 +127,8 @@ function install(pi: any, options: PiDshOptions) {
   let wakeCount = 0;
   const outbox = new Outbox();
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  /** A reminder is waiting: wake an idle session for it even under quiet delivery or the wake cap. */
+  let wakeRequested = false;
   /** Outcome of the latest turn; an aborted or failed run must not wake itself for stragglers. */
   let lastOutcome: string | undefined;
   let pendingGoalRound: RoundIdentity | undefined;
@@ -140,6 +147,7 @@ function install(pi: any, options: PiDshOptions) {
 
   const remember = (ctx: any) => { lastCtx = ctx; try { owner = ctx.sessionManager.getSessionId(); } catch { /* keep */ } };
   const persistOutbox = () => {
+    if (outbox.size === 0) wakeRequested = false;
     try { pi.appendEntry(ENTRY.outbox, outbox.snapshot()); } catch { /* session gone */ }
     refreshUI();
   };
@@ -149,7 +157,7 @@ function install(pi: any, options: PiDshOptions) {
     try {
       if (outbox.size === 0 || !lastCtx?.isIdle?.()) return; // a running session drains at its next boundary
       const capped = config.maxConsecutiveWakes !== undefined && wakeCount >= config.maxConsecutiveWakes;
-      if (!force && (config.completionDelivery === "quiet" || capped)) return; // waits for the next prompt
+      if (!force && !wakeRequested && (config.completionDelivery === "quiet" || capped)) return; // waits for the next prompt
       const batch = outbox.take();
       if (!batch) return;
       persistOutbox();
@@ -161,11 +169,20 @@ function install(pi: any, options: PiDshOptions) {
     if (flushTimer === undefined) flushTimer = setTimeout(flushIdle, config.noticeCoalesceMs);
   };
   /** Queue a notice. Delivery belongs to the boundary: turn_end / agent_before_settle mid-run, a coalesced wake when idle. */
-  const notify = (content: string, customType = "pi-dsh/notice", key?: string) => {
+  const notify = (content: string, customType = "pi-dsh/notice", key?: string, wake = false) => {
     outbox.enqueue(customType, content, key);
+    if (wake) wakeRequested = true;
     persistOutbox();
     scheduleFlush();
   };
+  const schedule = new ScheduleService({
+    dir: piDshDir("schedule"),
+    // A session whose context went stale cannot show the model anything, so it must not consume the reminder.
+    deliver: (body, key) => { if (!lastCtx) throw new Error("no session is running"); lastCtx.isIdle(); notify(body, "pi-dsh/schedule", key, true); },
+    warn: (message) => safeNotify(lastCtx, message, "warning"),
+    changed: () => refreshUI(),
+    retention: { days: config.scheduleHistoryDays ?? 30, records: config.scheduleHistoryRecords ?? 200 },
+  });
   /** Boundary drain: append the next batch of notices to a turn_end / agent_before_settle result and keep the run going. */
   const drainNotices = (e: { entries: any[] }) => {
     const batch = outbox.take();
@@ -174,7 +191,7 @@ function install(pi: any, options: PiDshOptions) {
     return { continue: true, entries: [...e.entries, { type: "custom_message" as const, customType: batch.customType, content: batch.content, display: true }] };
   };
   const uiState = (): UiState => ({
-    goal, todos, planActive, inbox: outbox.size,
+    goal, todos, planActive, inbox: outbox.size, reminders: schedule.list().length,
     jobs: jobs.list(owner), agents: subagents.list(owner), terminals: terminals.list(owner), teamTasks: board.snapshot(),
   });
   /** One refresh for every widget + status (DSH ui-goal/ui-jobs/ui-subagent, Pi-shaped). */
@@ -253,6 +270,7 @@ function install(pi: any, options: PiDshOptions) {
     subagents.restore(catalog);
     jobs.restore(owner);
     terminals.restore(owner);
+    if (config.schedule) schedule.attach(owner);
     refreshUI();
   }
 
@@ -274,6 +292,7 @@ function install(pi: any, options: PiDshOptions) {
     await terminals.disposeOwner(owner, { keepDurable: true }).catch(() => undefined);
     await subagents.disposeOwner(owner).catch(() => undefined);
     nodePtc.disposeAll();
+    schedule.detach();
   });
   pi.on("input", async (e: any, ctx: any) => {
     remember(ctx);
@@ -1240,6 +1259,20 @@ function install(pi: any, options: PiDshOptions) {
       if (result.flush) flushIdle(true);
     },
   });
+  if (config.schedule) {
+    registerScheduleTools(pi, { schedule, remember, zone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+    pi.registerCommand("schedule", {
+      description: "Reminders (/schedule [list | all | show <id> | history <id> [before] | delete <id>])",
+      handler: async (args: string, ctx: any) => {
+        remember(ctx);
+        let result: { text: string; changed: boolean };
+        try { result = runScheduleCommand(schedule, args); }
+        catch (e) { result = { text: `Error: ${e instanceof Error ? e.message : String(e)}`, changed: false }; }
+        if (result.changed) refreshUI();
+        safeNotify(ctx, result.text);
+      },
+    });
+  }
   // Goal round driver (dsh goal-round-driver, Pi-shaped). A round is admitted at
   // the settle boundary as a continuation of the running run: it cannot race a
   // human prompt, needs no synthetic user message, and an abort (which skips the
