@@ -2,7 +2,7 @@
 
 All notable changes to pi-dsh will be documented in this file.
 
-## Unreleased
+## 0.4.0 - 2026-10-22
 
 - External subagents: `externalSubagents` in `pi-dsh.json` adds `subagent_claude_code`, `subagent_codex`, and ACP tools that run a task as one unattended session of the installed product and return its final answer or a fixed-shape failure line (dsh subagent-claude-code, subagent-codex, subagent-acp). The product's environment is scrubbed of ambient credentials, stderr never reaches the model, and access is capped by the standing `sandboxMode`: Codex takes it as `--sandbox`, Claude Code gets an allowlist of file tools with no MCP servers or skills and `acceptEdits` under `workspace-write`, a wider setting is refused, and an ACP agent runs under bubblewrap with `writablePaths`. Run against the real Claude Code CLI (GLM via a Z.ai plan) and a real `opencode acp`; Codex only against the real binary with a local stand-in model server.
 - **Sandbox fix:** `bwrapArgs` mounted `/proc`, `/dev` and `/tmp` before the read-only root bind, so the host root covered them. The sandbox saw the host's `/proc` under a new pid namespace (programs built on Bun segfaulted at startup) and its `/tmp` was not private. The root now goes first, the workspace is bound after `/tmp` so a workspace under `/tmp` stays visible, and the sandbox gets a fresh `/proc` and a private writable `/tmp`. Anything that relied on seeing host `/tmp` files from inside a `read-only` or `workspace-write` sandbox no longer can.
