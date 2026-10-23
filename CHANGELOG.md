@@ -2,7 +2,7 @@
 
 All notable changes to pi-dsh will be documented in this file.
 
-## Unreleased
+## 0.5.0 - 2026-10-23
 
 - Schedule (dsh schedule, tool-schedule): `schedule_create`, `schedule_list`, `schedule_update`, `schedule_delete` and `/schedule`. Six rules (`after_seconds`, `at`, `every_seconds`, `daily`, `weekly`, `cron`), wall-clock rules in an explicit IANA zone with DSH's gap-skip and earlier-overlap behavior, latest-only catch-up after downtime, in-place updates that keep id and history, saved delivery history with a retention window and cap, and `schedule: false` to turn it off. Due reminders go through the notice outbox, wake an idle session even under `completionDelivery: "quiet"`, and ride the current run otherwise. Reminders are stored one file per session under `~/.pi/agent/pi-dsh/schedule/` and fire only while that session runs. Zone arithmetic is built on `Intl` (no new dependency) and was cross-checked against the Temporal polyfill DSH uses over about 1.2 million zone probes and 370,000 rule comparisons.
 
